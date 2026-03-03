@@ -235,7 +235,7 @@ def rtaa_attack(net, x_init, x, gt, target_pos, target_sz, scale_z, p, eps=10, a
         y_neg = torch.from_numpy(y_neg).cuda().long()
         pos_index = np.where(y_pos.cpu() == 1)
         neg_index = np.where(y_neg.cpu() == 0)
-        index = np.concatenate((pos_index, neg_index), axis=1)
+        index = np.concatenate((pos_index[0], neg_index[0]))
 
         # make pseudo lables
         y_pos_pseudo = np.where(label > iou_hi, 0, 1)
@@ -351,6 +351,7 @@ def SiamRPN_init(im, target_pos, target_sz, net, model_eval = None):
             p.instance_size = 271
 
         p.score_size = (p.instance_size - p.exemplar_size) / p.total_stride + 1
+    p.anchor = generate_anchor(p.total_stride, p.scales, p.ratios, int(p.score_size))
     if model_eval is not None:
         if p2.adaptive:
             if ((target_sz[0] * target_sz[1]) / float(state['im_h'] * state['im_w'])) < 0.004:

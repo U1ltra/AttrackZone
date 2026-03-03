@@ -11,7 +11,7 @@ import os
 from os import makedirs
 from os.path import realpath, dirname, join, isdir, exists
 
-from net import SiamRPNotb, SiamRPNBIG, SiamRPNvot
+from net import SiamRPNvot
 from run_attack import SiamRPN_init, SiamRPN_track
 from utils import rect_2_cxy_wh, cxy_wh_2_rect
 from datetime import datetime
@@ -20,6 +20,8 @@ import sys
 import pixellib
 from pixellib.semantic import semantic_segmentation
 import segment
+
+from tqdm import tqdm
 
 parser = argparse.ArgumentParser(description='PyTorch SiamRPN OTB Test')
 parser.add_argument('--dataset', dest='dataset', default='OTB2015', help='datasets')
@@ -30,6 +32,7 @@ realworldattack = False
 realtimeattack = False
 output_bboxes_on_added = False
 output_noise = False
+use_segmentation = False  # set True if deeplabv3_xception65_ade20k.h5 is available
 
 
 def track_video(model, video, dataset, net2=None):
@@ -45,14 +48,17 @@ def track_video(model, video, dataset, net2=None):
     #print(video)
     if 'attack_mask' in video:
         attack_masks = video['attack_mask']
-    else:
+    elif use_segmentation:
         attack_masks = None
         segment_image = semantic_segmentation()
         segment_image.load_ade20k_model("deeplabv3_xception65_ade20k.h5")
+    else:
+        attack_masks = None
+        segment_image = None
 
-        
-    out_path = join('out_data\\BIG_TO_OTB', dataset, datetime.now().strftime("%d-%m-%Y-%H-%M-%S"))
-    for f, image_file in enumerate(image_files):
+    out_path = join('out_data', 'VOT_attack', dataset, datetime.now().strftime("%d-%m-%Y-%H-%M-%S"))
+    video_writer = None
+    for f, image_file in enumerate(tqdm(image_files, desc="Processing frames")):
         if f >= len(gt):
             break
         im = cv2.imread(image_file)  # TODO: batch load
@@ -78,11 +84,11 @@ def track_video(model, video, dataset, net2=None):
             if f % 30 == 1:  # clean the perturbation from last frame
                 att_per = 0
                 def_per = 0
-                state, att_per, def_per = SiamRPN_track(state, im, f, regions[f-1], att_per, def_per, image_save, iter=10, attack_mask=None, final_pos = final_pos, im_bounds = [im.shape[1], im.shape[0]], use_alt_model = True)  # gt_track
+                state, att_per, def_per = SiamRPN_track(state, im, f, regions[f-1], att_per, def_per, image_save, iter=10, attack_mask=None, final_pos = final_pos, im_bounds = [im.shape[1], im.shape[0]], use_alt_model = False)  # gt_track
                 location = cxy_wh_2_rect(state['target_pos']+1, state['target_sz'])
                 regions.append(location)
             else:
-                state, att_per, def_per = SiamRPN_track(state, im, f, regions[f-1], att_per, def_per, image_save, iter=5, attack_mask=None, final_pos = final_pos, im_bounds = [im.shape[1], im.shape[0]], use_alt_model = True)  # gt_track
+                state, att_per, def_per = SiamRPN_track(state, im, f, regions[f-1], att_per, def_per, image_save, iter=5, attack_mask=None, final_pos = final_pos, im_bounds = [im.shape[1], im.shape[0]], use_alt_model = False)  # gt_track
                 location = cxy_wh_2_rect(state['target_pos']+1, state['target_sz'])
                 regions.append(location)
         toc += cv2.getTickCount() - tic
@@ -104,7 +110,7 @@ def track_video(model, video, dataset, net2=None):
                     transf = cv2.resize(transf, rdim, interpolation=cv2.INTER_CUBIC)
 
                     transf = np.multiply(transf, mask3d)
-            else:
+            elif use_segmentation:
                 mask_i, az_util = segment.segmentation_attack_mask(segment_image, image_file)
                 az_utils.append(az_util)
                 mask3d = np.stack((mask_i,)*3, axis=-1)
@@ -175,25 +181,27 @@ def track_video(model, video, dataset, net2=None):
 #            correct_idx = np.unravel_index(im.argmax(), im.shape)
 #            print(im[correct_idx[0]][correct_idx[1]][correct_idx[2]])
             #print(im)
-        if args.visualization and f >= 0:  # visualization
-            if f == 0: cv2.destroyAllWindows()
-            # Uncomment below to get bboxes
+        if f >= 0:  # save to video
+            vis_frame = im.copy().astype(np.uint8)
             if len(gt[f]) == 8:
-                cv2.polylines(im, [np.array(gt[f], np.int).reshape((-1, 1, 2))], True, (0, 255, 0), 2)
+                cv2.polylines(vis_frame, [np.array(gt[f], np.int32).reshape((-1, 1, 2))], True, (0, 255, 0), 2)
             else:
-                cv2.rectangle(im, (gt[f, 0], gt[f, 1]), (gt[f, 0] + gt[f, 2], gt[f, 1] + gt[f, 3]), (0, 255, 0), 2)
-            if len(location) == 8:
-                cv2.polylines(im, [location.reshape((-1, 1, 2))], True, (0, 255, 255), 2)
-            else:
-                location = [int(l) for l in location]  #
-                cv2.rectangle(im, (location[0], location[1]),
-                              (location[0] + location[2], location[1] + location[3]), (0, 255, 255), 2)
-            cv2.putText(im, str(f), (40, 40), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 255), 2)
-
-            cv2.imshow(video['name'], im)
-            cv2.waitKey(1)
+                x, y, w, h = int(gt[f][0]), int(gt[f][1]), int(gt[f][2]), int(gt[f][3])
+                cv2.rectangle(vis_frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
+            loc = [int(l) for l in location]
+            cv2.rectangle(vis_frame, (loc[0], loc[1]), (loc[0] + loc[2], loc[1] + loc[3]), (0, 255, 255), 2)
+            cv2.putText(vis_frame, str(f), (40, 40), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 255), 2)
+            if video_writer is None:
+                fh, fw = vis_frame.shape[:2]
+                if not isdir(out_path):
+                    makedirs(out_path)
+                video_path = os.path.join(out_path, '%s.mp4' % video['name'])
+                video_writer = cv2.VideoWriter(video_path, cv2.VideoWriter_fourcc(*'mp4v'), 30, (fw, fh))
+            video_writer.write(vis_frame)
         if type(att_per) != type(0):
             im = im_old
+    if video_writer is not None:
+        video_writer.release()
     toc /= cv2.getTickFrequency()
     print("UTILS")
     print(az_utils)
@@ -231,6 +239,10 @@ def load_dataset(dataset):
     info = json.load(open(json_path, 'r'))
     for v in info.keys():
         path_name = info[v]['name']
+
+        if path_name != "car1":
+            continue
+
         info[v]['image_files'] = [join(base_path, path_name, 'img', im_f) for im_f in info[v]['image_files']]
         #info[v]['gt'] = np.array(info[v]['gt_rect'])-[1,1,0,0]  # our tracker is 0-index
         info[v]['gt'] = np.array(info[v]['gt'])
@@ -241,38 +253,34 @@ def load_dataset(dataset):
 def main():
     global args, v_id
     args = parser.parse_args()
-    dataset_names = [] # Fill with generated datasets or videos
+    dataset_names = ['VOT2018']
     for dset in dataset_names:
-        try:
-            print(dset)
-            net = SiamRPNBIG()
-            net2 = SiamRPNotb()
-#            net = SiamRPNotb()
-#            net = SiamRPNvot()
-            net.load_state_dict(torch.load(join(realpath(dirname(__file__)), 'SiamRPNBIG.model')))
-            net2.load_state_dict(torch.load(join(realpath(dirname(__file__)), 'SiamRPNOTB.model')))
-            net.eval().cuda()
-            net2.eval().cuda()
+        # try:
+        print(dset)
+        net = SiamRPNvot()
+        net.load_state_dict(torch.load(join(realpath(dirname(__file__)), 'SiamRPNvot.model')))
+        net.eval().cuda()
+        net2 = None
 
-            dataset = load_dataset(dset)
-            #print(dataset)
-            fps_list = []
-            for v_id, video in enumerate(dataset.keys()):
-                if v_id > -1:
-                    fps_list.append(track_video(net, dataset[video], dset, net2=net2))
-            print('Mean Running Speed {:.1f}fps'.format(np.mean(np.array(fps_list))))
-            fps_list.clear()
-            del net
-            del dataset
-            del net2
-        except Exception as e:
-            print("!!!! FAILED TO RUN SET !!!!")
-            print(e)
-            fps_list.clear()
-            del net
-            del net2
-            del dataset
-            continue
+        dataset = load_dataset(dset)
+        # print(dataset)
+        fps_list = []
+        for v_id, video in enumerate(dataset.keys()):
+            if v_id > -1:
+                fps_list.append(track_video(net, dataset[video], dset, net2=net2))
+        print('Mean Running Speed {:.1f}fps'.format(np.mean(np.array(fps_list))))
+        fps_list.clear()
+        del net
+        del dataset
+        del net2
+        # except Exception as e:
+        #     print("!!!! FAILED TO RUN SET !!!!")
+        #     print(e)
+        #     fps_list.clear()
+        #     del net
+        #     del net2
+        #     del dataset
+        #     continue
 
 
 

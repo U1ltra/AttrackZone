@@ -123,7 +123,7 @@ def rtaa_attack(net, x_init, x, gt, target_pos, target_sz, scale_z, p, eps=10, a
         y_neg = torch.from_numpy(y_neg).cuda().long()
         pos_index = np.where(y_pos.cpu() == 1)
         neg_index = np.where(y_neg.cpu() == 0)
-        index = np.concatenate((pos_index, neg_index), axis=1)
+        index = np.concatenate((pos_index[0], neg_index[0]))
 
         # make pseudo lables
         y_pos_pseudo = np.where(label > iou_hi, 0, 1)
@@ -220,7 +220,7 @@ def rtaa_defnese(net, x_mask, x, gt, target_pos, target_sz, scale_z, p, eps=5, w
         y_neg = torch.from_numpy(y_neg).cuda().long()
         pos_index = np.where(y_pos.cpu() == 1)
         neg_index = np.where(y_neg.cpu() == 0)
-        index = np.concatenate((pos_index, neg_index), axis=1)
+        index = np.concatenate((pos_index[0], neg_index[0]))
 
         # make pseudo lables
         y_pos_pseudo = np.where(label > iou_hi, 0, 1)
