@@ -97,10 +97,15 @@ def _extract_x_crop(state, im):
     return Variable(x_crop).cuda(), scale_z, s_x
 
 
-def run_siamrpn_forward(net, x_crop, state, scale_z, K=10):
+def run_siamrpn_forward(net, x_crop, state, scale_z):
     """
     One SiamRPN forward pass.  Updates state with the top-1 result and returns
-    the top-K decoded bounding boxes for downstream SIFT re-ranking.
+    ALL decoded anchor hypotheses as a spatial candidate pool.
+
+    The pool is intentionally not filtered by pscore here — under adversarial
+    attack the pscore is corrupted and would bias candidate selection toward the
+    adversarial location.  Downstream, Stage 1 (H_bg IoU filter) selects the K
+    spatially-plausible candidates before Stage 2 (SIFT) ranks them.
 
     All bounding boxes are [x, y, w, h] in frame pixel coordinates.
 
@@ -110,15 +115,15 @@ def run_siamrpn_forward(net, x_crop, state, scale_z, K=10):
     x_crop   : (1, 3, H, W) CUDA tensor — may be clean or adversarially perturbed
     state    : tracker state dict (mutated in-place with the top-1 result)
     scale_z  : float — search-region scale factor
-    K        : int   — number of top hypotheses to return
 
     Returns
     -------
     pred_bbox   : np.ndarray [x, y, w, h] — top-1 prediction in frame coords
-    hypotheses  : list of K dicts with keys
+                  (selected by pscore — this is the tracker's reported output)
+    hypotheses  : list of ALL anchor dicts with keys
                     bbox           [x,y,w,h]
                     siamrpn_score  raw softmax score
-                    pscore         penalised + windowed score used for ranking
+                    pscore         penalised + windowed score (for logging only)
     """
     p = state['p']
     target_pos = state['target_pos']
@@ -180,10 +185,12 @@ def run_siamrpn_forward(net, x_crop, state, scale_z, K=10):
     state['target_sz'] = np.array([best_bbox[2], best_bbox[3]])
     state['score'] = float(score_raw[best_id])
 
-    # --- Top-K hypotheses (sorted best-first by pscore) ---
-    top_k_ids = np.argsort(pscore)[::-1][:K]
+    # --- Full anchor pool (all anchors, no pscore filtering) ---
+    # Decoding all ~1445 anchors is fast (numpy); SIFT scoring happens only on
+    # the K candidates selected by Stage 1, so this does not add significant cost.
+    n_anchors = len(score_raw)
     hypotheses = []
-    for idx in top_k_ids:
+    for idx in range(n_anchors):
         hypotheses.append({
             'bbox': _decode(idx),
             'siamrpn_score': float(score_raw[idx]),
@@ -250,29 +257,99 @@ def sift_local_score(detector, prev_frame, curr_frame, ref_bbox, hyp_bbox):
     return float(np.clip(0.4 * match_r + 0.4 * inlier_r + 0.2 * desc_s, 0.0, 1.0))
 
 
-def score_and_rank(detector, prev_frame, curr_frame, prev_pred_bbox, hypotheses):
+def _warp_bbox(bbox, H):
     """
-    Run the two-stage pipeline on all hypotheses and sort by SIFT score.
+    Warp a [x, y, w, h] bounding box through homography H.
 
-    Stage 1 (global homography) is computed here and returned for logging.
-    Stage 2 (local crop matching) scores each hypothesis.
-
-    Returns: sorted_hypotheses (best first), H_bg (3×3 or None)
+    All four corners are transformed and the axis-aligned bounding rectangle
+    of the warped corners is returned as [x, y, w, h].
     """
+    x, y, w, h = bbox
+    corners = np.float32([[x, y], [x + w, y], [x, y + h], [x + w, y + h]])
+    warped = cv2.perspectiveTransform(corners.reshape(-1, 1, 2), H).reshape(-1, 2)
+    x1, y1 = warped.min(axis=0)
+    x2, y2 = warped.max(axis=0)
+    return np.array([x1, y1, x2 - x1, y2 - y1])
+
+
+def _bbox_iou(a, b):
+    """IoU between two [x, y, w, h] bounding boxes."""
+    ax1, ay1 = a[0], a[1]
+    ax2, ay2 = a[0] + a[2], a[1] + a[3]
+    bx1, by1 = b[0], b[1]
+    bx2, by2 = b[0] + b[2], b[1] + b[3]
+    inter_w = max(0.0, min(ax2, bx2) - max(ax1, bx1))
+    inter_h = max(0.0, min(ay2, by2) - max(ay1, by1))
+    inter = inter_w * inter_h
+    union = a[2] * a[3] + b[2] * b[3] - inter
+    return float(inter / union) if union > 0 else 0.0
+
+
+def score_and_rank(detector, prev_frame, curr_frame, prev_pred_bbox, all_hypotheses, K=10):
+    """
+    Two-stage scoring pipeline.
+
+    Stage 1 — spatial filtering via H_bg
+        Estimate the global camera-motion homography H_bg from full-frame SIFT.
+        Warp prev_pred_bbox through H_bg to obtain predicted_bbox: where the
+        target would land under pure camera motion.  Select the K hypotheses
+        from the full anchor pool with the highest IoU against predicted_bbox.
+        This bypasses the corrupted pscore and avoids wasting SIFT computation
+        on anchors that are spatially far from any plausible target location.
+
+        Fallback: if H_bg estimation fails (too few global matches), fall back
+        to top-K by pscore to keep the pipeline running.
+
+    Stage 2 — appearance correspondence via local SIFT
+        For each of the K spatial candidates, match SIFT keypoints between
+        prev_frame[prev_pred_bbox] and curr_frame[hypothesis_bbox].
+        Score = 0.4·match_ratio + 0.4·inlier_ratio + 0.2·descriptor_sim.
+        Adversarially-induced candidates score near zero because the RTAA
+        perturbation has no real temporal correspondence to the previous template.
+
+    Returns
+    -------
+    candidates : list of K dicts, sorted by sift_score descending, each with
+                   bbox, siamrpn_score, pscore, sift_score, iou_with_predicted
+    H_bg       : 3×3 ndarray or None
+    predicted_bbox : [x,y,w,h] warped bbox or None (for logging / visualisation)
+    """
+    # --- Stage 1: H_bg + IoU-based candidate selection ---
     H_bg = stage1_global_homography(detector, prev_frame, curr_frame)
-    for hyp in hypotheses:
-        hyp['sift_score'] = sift_local_score(
-            detector, prev_frame, curr_frame, prev_pred_bbox, hyp['bbox']
+    predicted_bbox = None
+
+    if H_bg is not None:
+        predicted_bbox = _warp_bbox(prev_pred_bbox, H_bg)
+        ious = [_bbox_iou(h['bbox'], predicted_bbox) for h in all_hypotheses]
+        top_k_ids = np.argsort(ious)[::-1][:K]
+        candidates = []
+        for idx in top_k_ids:
+            h = dict(all_hypotheses[idx])   # copy so we can add sift_score
+            h['iou_with_predicted'] = float(ious[idx])
+            candidates.append(h)
+    else:
+        # H_bg failed — fall back to pscore ranking
+        raise RuntimeError("Global homography estimation failed; cannot select candidates by spatial prior.")
+        sorted_hyps = sorted(all_hypotheses, key=lambda h: h['pscore'], reverse=True)[:K]
+        candidates = [dict(h) for h in sorted_hyps]
+        for c in candidates:
+            c['iou_with_predicted'] = float('nan')
+
+    # --- Stage 2: local SIFT correspondence ---
+    for c in candidates:
+        c['sift_score'] = sift_local_score(
+            detector, prev_frame, curr_frame, prev_pred_bbox, c['bbox']
         )
-    hypotheses.sort(key=lambda h: h['sift_score'], reverse=True)
-    return hypotheses, H_bg
+    candidates.sort(key=lambda h: h['sift_score'], reverse=True)
+
+    return candidates, H_bg, predicted_bbox
 
 
 # ---------------------------------------------------------------------------
 # Perturbation injection: search-region tensor → raw frame pixels
 # ---------------------------------------------------------------------------
 
-def inject_perturbation(im, att_per_tensor, target_pos, s_x, instance_size):
+def inject_perturbation(im, att_per_tensor, target_pos, s_x):
     """
     Project the RTAA search-region perturbation back onto the raw frame pixels.
 
@@ -383,7 +460,7 @@ def load_video(dataset_name, video_name):
     json_path = join(realpath(dirname(__file__)), 'data', dataset_name + '.json')
     info = json.load(open(json_path))
 
-    for k, v in info.items():
+    for v in info.values():
         if v['name'] == video_name:
             v['image_files'] = [
                 join(realpath(dirname(__file__)), 'data', dataset_name, v['name'], 'img', f)
@@ -447,11 +524,11 @@ def run(args):
         x_crop, scale_z, _ = _extract_x_crop(state, im)
 
         pred_bbox, hypotheses = run_siamrpn_forward(
-            net, x_crop, state, scale_z, K=args.K
+            net, x_crop, state, scale_z
         )
 
-        ranked_hyps, H_bg = score_and_rank(
-            detector, prev_frame, im, prev_pred_bbox, hypotheses
+        ranked_hyps, _, _ = score_and_rank(
+            detector, prev_frame, im, prev_pred_bbox, hypotheses, K=args.K
         )
 
         benign_log.append({
@@ -520,16 +597,16 @@ def run(args):
         att_per = x_adv - x_crop
 
         # Inject perturbation into raw frame so SIFT sees the attack signal
-        im_attacked = inject_perturbation(im, att_per, target_pos, s_x, p.instance_size)
+        im_attacked = inject_perturbation(im, att_per, target_pos, s_x)
 
         # Forward on attacked crop; updates state top-1
         pred_bbox, hypotheses = run_siamrpn_forward(
-            net, x_adv, state, scale_z, K=args.K
+            net, x_adv, state, scale_z
         )
 
         # Two-stage SIFT ranking on attacked frames
-        ranked_hyps, H_bg = score_and_rank(
-            detector, prev_frame, im_attacked, prev_pred_bbox, hypotheses
+        ranked_hyps, _, _ = score_and_rank(
+            detector, prev_frame, im_attacked, prev_pred_bbox, hypotheses, K=args.K
         )
 
         # GT baseline: how well does GT_t correspond to GT_{t-1} under attack?
@@ -644,9 +721,9 @@ def main():
                         help='Video sequence name')
     parser.add_argument('--model',    default='SiamRPNvot.model')
     parser.add_argument('--out_dir',  default='out/hypothesis_ranking')
-    parser.add_argument('--K',        type=int, default=10,
+    parser.add_argument('--K',        type=int, default=20,
                         help='Number of top-K hypotheses extracted from response map')
-    parser.add_argument('--n_frames', type=int, default=10,
+    parser.add_argument('--n_frames', type=int, default=5,
                         help='Number of simulation frames after init')
     parser.add_argument('--seed',     type=int, default=None,
                         help='RNG seed for start-frame selection (random if omitted)')
