@@ -411,7 +411,8 @@ def _draw_bbox(frame, bbox, color, thickness=2, label=None):
 
 
 def render_frame(clean_frame, gt_bbox, benign_pred, attack_pred,
-                 top5_attack_hyps, frame_num, top_sift_score, gt_sift_score):
+                 top5_attack_hyps, frame_num, top_sift_score, gt_sift_score,
+                 pred_sift_score):
     """
     Compose one annotated output frame.
 
@@ -438,8 +439,9 @@ def render_frame(clean_frame, gt_bbox, benign_pred, attack_pred,
     h = vis.shape[0]
     lines = [
         f"Frame: {frame_num}",
-        f"Top SIFT: {top_sift_score:.3f}",
-        f"GT SIFT:  {gt_sift_score:.3f}",
+        f"Top SIFT:  {top_sift_score:.3f}",
+        f"GT SIFT:   {gt_sift_score:.3f}",
+        f"Pred SIFT: {pred_sift_score:.3f}",
     ]
     for i, line in enumerate(lines):
         y_pos = h - 8 - (len(lines) - 1 - i) * 20
@@ -614,11 +616,17 @@ def run(args):
             detector, prev_frame, im_attacked, prev_gt_bbox, gt[f]
         )
 
+        # Prediction baseline: SIFT score of the (corrupted) attack prediction
+        pred_sift = sift_local_score(
+            detector, prev_frame, im_attacked, prev_pred_bbox, pred_bbox
+        )
+
         attack_log.append({
             'frame_idx': f,
             'pred_bbox': pred_bbox.copy(),
             'gt_bbox': gt[f].copy(),
             'gt_sift_score': gt_sift,
+            'pred_sift_score': pred_sift,
             'hypotheses': [
                 {k: (v.copy() if isinstance(v, np.ndarray) else v)
                  for k, v in h.items()}
@@ -644,7 +652,8 @@ def run(args):
             'hyp_rawscore':np.array([[h['siamrpn_score'] for h in e['hypotheses']] for e in log]),
         }
         if with_gt_sift:
-            out['gt_sift_scores'] = np.array([e['gt_sift_score'] for e in log])
+            out['gt_sift_scores']   = np.array([e['gt_sift_score']   for e in log])
+            out['pred_sift_scores'] = np.array([e['pred_sift_score'] for e in log])
         return out
 
     b = _flatten(benign_log, with_gt_sift=False)
@@ -673,6 +682,7 @@ def run(args):
         attack_hyp_pscore=a['hyp_pscore'],
         attack_hyp_rawscore=a['hyp_rawscore'],
         attack_gt_sift_scores=a['gt_sift_scores'],
+        attack_pred_sift_scores=a['pred_sift_scores'],
     )
     print(f"\nLog  → {log_path}")
 
@@ -700,6 +710,7 @@ def run(args):
             frame_num=b_e['frame_idx'],
             top_sift_score=top_sift,
             gt_sift_score=a_e['gt_sift_score'],
+            pred_sift_score=a_e['pred_sift_score'],
         )
         writer.write(vis)
 
