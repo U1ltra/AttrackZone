@@ -1,2 +1,4 @@
 data/
 out_data/
+out/
+__pycache__/
