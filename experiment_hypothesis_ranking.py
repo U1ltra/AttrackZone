@@ -254,7 +254,7 @@ def sift_local_score(detector, prev_frame, curr_frame, ref_bbox, hyp_bbox):
     match_r = float(min(len(good) / n, 1.0))
     inlier_r = float(detector._ransac_inlier_ratio(kp_ref, kp_hyp, good))
     desc_s = float(detector._descriptor_similarity(good))
-    return float(np.clip(0.4 * match_r + 0.4 * inlier_r + 0.2 * desc_s, 0.0, 1.0))
+    return float(np.clip(0.1 * match_r + 0.45 * inlier_r + 0.45 * desc_s, 0.0, 1.0))
 
 
 def _warp_bbox(bbox, H):
@@ -321,6 +321,8 @@ def score_and_rank(detector, prev_frame, curr_frame, prev_pred_bbox, all_hypothe
     if H_bg is not None:
         predicted_bbox = _warp_bbox(prev_pred_bbox, H_bg)
         ious = [_bbox_iou(h['bbox'], predicted_bbox) for h in all_hypotheses]
+        if K == -1:
+            K = len(all_hypotheses)
         top_k_ids = np.argsort(ious)[::-1][:K]
         candidates = []
         for idx in top_k_ids:
