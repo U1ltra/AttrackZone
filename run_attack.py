@@ -171,7 +171,7 @@ class TrackerConfig(object):
 #        x_adv = torch.clamp(x_adv, x_val_min, x_val_max)
 #        x_adv = Variable(x_adv.data, requires_grad=True)
 #    return x_adv
-def rtaa_attack(net, x_init, x, gt, target_pos, target_sz, scale_z, p, eps=10, alpha=1, iteration=10, x_val_min=0, x_val_max=255, final_pos=None, im_bounds = None):
+def rtaa_attack(net, x_init, x, gt, target_pos, target_sz, scale_z, p, eps=100, alpha=1, iteration=100, x_val_min=0, x_val_max=255, final_pos=None, im_bounds = None):
     x = Variable(x.data)
     x_adv = Variable(x_init.data, requires_grad=True)
 
