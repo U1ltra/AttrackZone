@@ -684,7 +684,8 @@ def run(args):
         cl_iou_gt[ti]  = ig
         cl_pscores[ti] = ps
 
-    log_path = join(args.out_dir, f"log_masked_{args.video}.npz")
+    log_stem = getattr(args, 'out_stem', None) or f"log_masked_{args.video}"
+    log_path = join(args.out_dir, f"{log_stem}.npz")
     np.savez(
         log_path,
         # --- metadata ---
@@ -765,6 +766,8 @@ def main():
     parser.add_argument('--video',     required=True)
     parser.add_argument('--model',     default='SiamRPNvot.model')
     parser.add_argument('--out_dir',   default='out/masked_hypothesis')
+    parser.add_argument('--out_stem',  default=None,
+                        help='Log filename stem (default: log_masked_<video>)')
     parser.add_argument('--N_masks',   type=int, default=8,
                         help='N horizontal + N vertical stripe masks (default 8, giving 16+4=20 total)')
     parser.add_argument('--K_clusters', type=int, default=20,
