@@ -117,24 +117,40 @@ def main():
             edgecolors='none',
         )
 
-    # --- Cluster representatives (larger, sized by vote_count) ---
+    # --- Cluster representatives (larger hollow circles, sized by vote_count) ---
+    # These show spatial deduplication: many masks predicting the same location
+    # get collapsed into one cluster. Size = how many masks agreed (vote_count).
+    # NOTE: reps are chosen by pscore, not SIFT — so #1 rank is annotated on
+    # the raw mask dots below, not here.
     if len(cl_sift_v) > 0:
-        vote_scale = 120 + 60 * cl_votes_v   # base size + extra per vote
-        ax.scatter(
-            cl_iou_v, cl_sift_v,
-            s=vote_scale, color='white', edgecolors='black', linewidths=1.5,
-            zorder=4, alpha=0.85,
-            label=f'Cluster reps ({int(cl_valid.sum())} clusters)',
-        )
-
-        # Annotate top-3 by SIFT score (rank is already index order since we sorted)
-        for rank in range(min(3, len(cl_sift_v))):
+        vote_scale = 120 + 60 * cl_votes_v
+        # ax.scatter(
+        #     cl_iou_v, cl_sift_v,
+        #     s=vote_scale, color='none', edgecolors='black', linewidths=1.5,
+        #     zorder=4, alpha=0.85,
+        #     label=f'Cluster reps — {int(cl_valid.sum())} clusters\n'
+        #           f'(circle size ∝ vote count)',
+        # )
+        # Label each cluster rep with its vote count only (no rank)
+        for ki in range(len(cl_sift_v)):
             ax.annotate(
-                f'#{rank+1}  v={int(cl_votes_v[rank])}',
-                xy=(cl_iou_v[rank], cl_sift_v[rank]),
-                xytext=(6, 4), textcoords='offset points',
-                fontsize=12, color='black',
+                f'v={int(cl_votes_v[ki])}',
+                xy=(cl_iou_v[ki], cl_sift_v[ki]),
+                xytext=(5, 3), textcoords='offset points',
+                fontsize=9, color='black',
             )
+
+    # --- Annotate top-3 raw mask hypotheses by SIFT score ---
+    # These are the actual recovery candidates: the dots with highest SIFT
+    # correspondence to the previous template.
+    top3_mask_idx = np.argsort(mask_sift)[::-1][:3]
+    for rank, mi in enumerate(top3_mask_idx):
+        ax.annotate(
+            f'#{rank+1}',
+            xy=(mask_iou_gt[mi], mask_sift[mi]),
+            xytext=(5, 4), textcoords='offset points',
+            fontsize=13, color='navy', fontweight='bold',
+        )
 
     # --- Attack prediction ---
     ax.scatter(
@@ -166,11 +182,16 @@ def main():
         mpatches.Patch(color='darkorange',     label='v-stripe masks'),
         mpatches.Patch(color='mediumseagreen', label='quadrant masks (4)'),
     ]
-    leg1 = ax.legend(handles=type_legend, fontsize=11, loc='lower right',
-                     title='Mask type  (darker α = higher pert. coverage)',
-                     title_fontsize=9)
+    # leg1 = ax.legend(handles=type_legend, fontsize=11, loc='lower right',
+    #                  title='Mask type  (darker α = higher pert. coverage)',
+    #                  title_fontsize=9)
+    # put legend outside the plot area on the right
+    leg1 = ax.legend(handles=type_legend, fontsize=11, loc='center left', bbox_to_anchor=(1.02, 0.3),
+                     title='Mask type  (darker α = higher pert. coverage)', title_fontsize=9)
     ax.add_artist(leg1)
-    ax.legend(fontsize=11, loc='upper left')
+    # ax.legend(fontsize=11, loc='upper left')
+    # put legend outside the plot area on the right
+    ax.legend(fontsize=11, loc='center left', bbox_to_anchor=(1.02, 0.7))
 
     ax.set_xlabel('IoU with Ground Truth', fontsize=16)
     ax.set_ylabel('SIFT Correspondence Score', fontsize=16)
