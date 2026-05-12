@@ -171,11 +171,72 @@ class TrackerConfig(object):
 #        x_adv = torch.clamp(x_adv, x_val_min, x_val_max)
 #        x_adv = Variable(x_adv.data, requires_grad=True)
 #    return x_adv
-def rtaa_attack(net, x_init, x, gt, target_pos, target_sz, scale_z, p, eps=100, alpha=1, iteration=100, x_val_min=0, x_val_max=255, final_pos=None, im_bounds = None):
+def rtaa_attack(net, x_init, x, gt, target_pos, target_sz, scale_z, p,
+                eps=150, alpha=1, iteration=200, x_val_min=0, x_val_max=255,
+                final_pos=None, im_bounds=None,
+                pscore_weight=10.0,
+                pseudo_iou_thresh=0.4, truth_suppress_iou_thresh=0.3):
+    """RTAA attack with a pscore-targeted objective.
+
+    `tracker_eval` ranks anchors by
+        pscore = penalty * softmax(score) * (1-wi) + window * wi
+    so an attack that only inflates raw logits can leave pscore robust:
+    fake peaks at peripheral / off-size anchors get killed by the window
+    and penalty terms. This makes pscore-based defenses look stronger
+    than they really are in the recovery scenario.
+
+    Two changes anchor the attack toward the recovery setup:
+      1. Pseudo geometry tuned for max pscore at the fake location:
+         rate_wd=1.0 (penalty ~= 1) and rate_xy=0.3 (well inside the cosine
+         window's central lobe).
+      2. A differentiable pscore term:
+           - MAXIMIZE pscore at anchors whose current prediction overlaps
+             the pseudo box   -> pscore re-ranking is fooled,
+           - MINIMIZE pscore at anchors whose current prediction overlaps
+             the true GT      -> true-target hypotheses look weak even if
+             a defense partially recovers them.
+    """
     x = Variable(x.data)
     x_adv = Variable(x_init.data, requires_grad=True)
 
     alpha = eps * 1.0 / iteration
+
+    # Pseudo geometry tuned for max pscore: same size as truth (penalty ~= 1)
+    # and a moderate displacement that stays inside the cosine window peak.
+    if final_pos is None or im_bounds is None:
+        rate_xy1 = 0.3
+        rate_xy2 = 0.3
+        rate_wd = 1.0
+    else:
+        rate_xy1 = (final_pos[0] - target_pos[0]) / im_bounds[0]
+        rate_xy2 = (final_pos[1] - target_pos[1]) / im_bounds[1]
+        max_change = max(abs((final_pos[2] - target_sz[0])), abs((final_pos[3] - target_sz[1])))
+        if max_change == abs((final_pos[2] - target_sz[0])):
+            rate_wd = (final_pos[2] - target_sz[0]) / im_bounds[0]
+        else:
+            rate_wd = (final_pos[3] - target_sz[1]) / im_bounds[1]
+
+    # ---- static tensors used by the differentiable pscore term ----
+    score_size_int = int(p.score_size)
+    win_2d = np.outer(np.hanning(score_size_int), np.hanning(score_size_int))
+    window_np = np.tile(win_2d.flatten(), p.anchor_num).astype(np.float32)
+    window_t = torch.from_numpy(window_np).cuda()
+
+    tsz_scaled = np.asarray(target_sz, dtype=np.float32) * scale_z
+    tsz0 = torch.tensor(float(tsz_scaled[0])).cuda()
+    tsz1 = torch.tensor(float(tsz_scaled[1])).cuda()
+    anchor_w_t = torch.from_numpy(p.anchor[:, 2].astype(np.float32)).cuda()
+    anchor_h_t = torch.from_numpy(p.anchor[:, 3].astype(np.float32)).cuda()
+
+    def _change_t(r):
+        return torch.maximum(r, 1.0 / r)
+
+    def _sz_t(w, h):
+        pad = (w + h) * 0.5
+        return torch.sqrt((w + pad) * (h + pad))
+
+    target_sz_norm = _sz_t(tsz0, tsz1)
+    target_ratio = tsz0 / tsz1
 
     for i in range(iteration):
         delta, score = net(x_adv)
@@ -193,22 +254,9 @@ def rtaa_attack(net, x_init, x, gt, target_pos, target_sz, scale_z, p, eps=100, 
         gt_cen[:, 2] = np.log(gt_cen[:, 2] * scale_z) / p.anchor[:, 2]
         gt_cen[:, 3] = np.log(gt_cen[:, 3] * scale_z) / p.anchor[:, 3]
 
-        # create pseudo proposals randomly
+        # pseudo proposals at the high-pscore offset
         gt_cen_pseudo = rect_2_cxy_wh(gt)
         gt_cen_pseudo = np.tile(gt_cen_pseudo, (p.anchor.shape[0], 1))
-        
-        if final_pos is None or im_bounds is None:
-            rate_xy1 = 0.5
-            rate_xy2 = 0.5
-            rate_wd = 0.9
-        else:
-            rate_xy1 = (final_pos[0] - target_pos[0])/im_bounds[0]
-            rate_xy2 = (final_pos[1] - target_pos[1])/im_bounds[1]
-            max_change = max(abs((final_pos[2] - target_sz[0])), abs((final_pos[3] - target_sz[1])))
-            if(max_change == abs((final_pos[2] - target_sz[0]))):
-                rate_wd = (final_pos[2] - target_sz[0])/im_bounds[0]
-            else:
-                rate_wd = (final_pos[3] - target_sz[1])/im_bounds[1]
 
         gt_cen_pseudo[:, 0] = ((gt_cen_pseudo[:, 0] - target_pos[0] - rate_xy1 * gt_cen_pseudo[:, 2]) * scale_z - p.anchor[:, 0]) / p.anchor[:, 2]
         gt_cen_pseudo[:, 1] = ((gt_cen_pseudo[:, 1] - target_pos[1] - rate_xy2 * gt_cen_pseudo[:, 3]) * scale_z - p.anchor[:, 1]) / p.anchor[:, 3]
@@ -223,6 +271,15 @@ def rtaa_attack(net, x_init, x, gt, target_pos, target_sz, scale_z, p, eps=100, 
         location = np.array([delta[0] - delta[2] / 2, delta[1] - delta[3] / 2, delta[2], delta[3]])
 
         label = overlap_ratio(location, gt)
+
+        # IoU vs pseudo box (drives the pscore-MAX term)
+        pseudo_box = np.array([
+            gt[0] + rate_xy1 * gt[2],
+            gt[1] + rate_xy2 * gt[3],
+            gt[2] * rate_wd,
+            gt[3] * rate_wd,
+        ], dtype=np.float32)
+        label_pseudo = overlap_ratio(location, pseudo_box)
 
         # set thresold to define positive and negative samples, following the training step
         iou_hi = 0.7
@@ -256,8 +313,28 @@ def rtaa_attack(net, x_init, x, gt, target_pos, target_sz, scale_z, p, eps=100, 
         loss_pseudo_reg = -rpn_smoothL1(delta1, gt_cen_pseudo, y_pos)
         loss_reg = (loss_truth_reg - loss_pseudo_reg) * (5)
 
+        # ---- differentiable pscore term ----
+        sm_score = F.softmax(score, dim=1)[:, 1]                     # P(foreground), [N]
+
+        w_pred = torch.exp(delta1[2, :]) * anchor_w_t
+        h_pred = torch.exp(delta1[3, :]) * anchor_h_t
+        s_c = _change_t(_sz_t(w_pred, h_pred) / target_sz_norm)
+        r_c = _change_t(target_ratio / (w_pred / h_pred))
+        penalty = torch.exp(-(r_c * s_c - 1.0) * p.penalty_k)
+
+        pscore_t = penalty * sm_score * (1.0 - p.window_influence) + window_t * p.window_influence
+
+        pseudo_mask = torch.from_numpy((label_pseudo > pseudo_iou_thresh).astype(np.float32)).cuda()
+        truth_mask = torch.from_numpy((label > truth_suppress_iou_thresh).astype(np.float32)).cuda()
+        n_p = pseudo_mask.sum().clamp_min(1.0)
+        n_t = truth_mask.sum().clamp_min(1.0)
+
+        loss_pscore_pseudo = -(pscore_t * pseudo_mask).sum() / n_p   # MAX pscore at pseudo
+        loss_pscore_truth = (pscore_t * truth_mask).sum() / n_t      # MIN pscore at truth
+        loss_pscore = (loss_pscore_pseudo + loss_pscore_truth) * pscore_weight
+
         # final adversarial loss
-        loss = loss_cls + loss_reg
+        loss = loss_cls + loss_reg + loss_pscore
 
         # calculate the derivative
         net.zero_grad()
