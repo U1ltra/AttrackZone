@@ -175,8 +175,16 @@ def rtaa_attack(net, x_init, x, gt, target_pos, target_sz, scale_z, p,
                 eps=150, alpha=1, iteration=200, x_val_min=0, x_val_max=255,
                 final_pos=None, im_bounds=None,
                 pscore_weight=10.0,
-                pseudo_iou_thresh=0.4, truth_suppress_iou_thresh=0.3):
+                pseudo_iou_thresh=0.4, truth_suppress_iou_thresh=0.3,
+                attack_mask=None):
     """RTAA attack with a pscore-targeted objective.
+
+    If `attack_mask` is given (broadcastable to x_adv, values in {0,1}), after
+    each gradient step the perturbation is projected back onto the mask:
+        x_adv = x + attack_mask * (x_adv - x)
+    so masked-out pixels stay at their clean value. This makes the optimization
+    aware of the physical-realizability constraint instead of only zeroing the
+    perturbation post hoc at render time.
 
     `tracker_eval` ranks anchors by
         pscore = penalty * softmax(score) * (1-wi) + window * wi
@@ -349,6 +357,8 @@ def rtaa_attack(net, x_init, x, gt, target_pos, target_sz, scale_z, p,
         x_adv = where(x_adv > x + eps, x + eps, x_adv)
         x_adv = where(x_adv < x - eps, x - eps, x_adv)
         x_adv = torch.clamp(x_adv, x_val_min, x_val_max)
+        if attack_mask is not None:
+            x_adv = x + attack_mask * (x_adv - x)
         x_adv = Variable(x_adv.data, requires_grad=True)
 
     return x_adv

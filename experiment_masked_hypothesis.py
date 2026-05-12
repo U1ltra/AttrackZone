@@ -356,13 +356,76 @@ def sift_local_score(detector, prev_frame, curr_frame, ref_bbox, hyp_bbox):
 
 
 # ---------------------------------------------------------------------------
-# Perturbation injection into raw frame (unchanged from reference script)
+# Segmentation-mask cropping (mirrors get_subwindow_tracking geometry)
 # ---------------------------------------------------------------------------
 
-def inject_perturbation(im, att_per_tensor, target_pos, s_x):
+def crop_mask_to_search(mask_full, target_pos, original_sz, model_sz):
+    """
+    Crop a full-image binary mask around `target_pos` with side `original_sz`
+    and resize to (model_sz, model_sz), matching the geometry of
+    `get_subwindow_tracking`.  Out-of-image regions are padded with 0
+    (non-perturbable).  NEAREST interpolation keeps the mask binary.
+
+    Returns: torch float tensor of shape (1, 1, model_sz, model_sz) on CUDA,
+    ready to broadcast across the (1, 3, model_sz, model_sz) search crop.
+    """
+    sz = original_sz
+    c  = (sz + 1) / 2
+    x_min = round(target_pos[0] - c)
+    x_max = x_min + sz - 1
+    y_min = round(target_pos[1] - c)
+    y_max = y_min + sz - 1
+    H, W = mask_full.shape[:2]
+    left_pad   = int(max(0., -x_min))
+    top_pad    = int(max(0., -y_min))
+    right_pad  = int(max(0., x_max - W + 1))
+    bottom_pad = int(max(0., y_max - H + 1))
+    x_min += left_pad; x_max += left_pad
+    y_min += top_pad;  y_max += top_pad
+    if left_pad or top_pad or right_pad or bottom_pad:
+        m_pad = np.zeros((H + top_pad + bottom_pad,
+                          W + left_pad + right_pad), dtype=np.float32)
+        m_pad[top_pad:top_pad+H, left_pad:left_pad+W] = mask_full.astype(np.float32)
+        crop = m_pad[int(y_min):int(y_max+1), int(x_min):int(x_max+1)]
+    else:
+        crop = mask_full[int(y_min):int(y_max+1),
+                         int(x_min):int(x_max+1)].astype(np.float32)
+    crop_resized = cv2.resize(crop, (model_sz, model_sz),
+                              interpolation=cv2.INTER_NEAREST)
+    return (torch.from_numpy(crop_resized.astype(np.float32))
+            .unsqueeze(0).unsqueeze(0).cuda())
+
+
+# ---------------------------------------------------------------------------
+# Perturbation injection into raw frame
+# ---------------------------------------------------------------------------
+
+def inject_perturbation(im, att_per_tensor, target_pos, s_x,
+                        attack_mask=None, clip_negatives=False):
+    """
+    Render the search-crop perturbation onto the full image inside the search
+    region centered at `target_pos`.
+
+    `clip_negatives`: if True, zero out negative perturbation values before
+    rendering.  Matches test_hijack_attack.py's "physical patch" approximation
+    (a printed sticker can only add light, not subtract).  Visualization-only:
+    the tracker's own forward pass still uses the signed perturbation.
+
+    `attack_mask`: if given, the same search-crop binary mask used by
+    rtaa_attack to constrain the optimization.  Resized to (s_x, s_x) with
+    NEAREST interpolation and applied to the perturbation before compositing,
+    so the rendered image cannot drift outside the masked region.
+    """
     att_np   = att_per_tensor.cpu().detach().squeeze(0).permute(1,2,0).numpy()
+    if clip_negatives:
+        att_np = np.where(att_np < 0, 0, att_np)
     s_x_int  = int(round(s_x))
     att_res  = cv2.resize(att_np.astype(np.float32), (s_x_int, s_x_int))
+    if attack_mask is not None:
+        mask_np  = attack_mask.detach().squeeze(0).squeeze(0).cpu().numpy()
+        mask_res = cv2.resize(mask_np.astype(np.float32), (s_x_int, s_x_int),
+                              interpolation=cv2.INTER_NEAREST)
+        att_res  = att_res * mask_res[:, :, np.newaxis]
     cx, cy   = int(round(target_pos[0])), int(round(target_pos[1]))
     x1, y1   = cx - s_x_int//2, cy - s_x_int//2
     h, w     = im.shape[:2]
@@ -475,6 +538,15 @@ def run(args):
 
     detector = SIFTAlignmentDetector()
 
+    # --- Optional segmentation (loaded once, reused per frame) ---
+    seg_model = None
+    if args.use_segmentation:
+        from pixellib.semantic import semantic_segmentation
+        from segment import segmentation_attack_mask as _seg_fn
+        seg_model = semantic_segmentation()
+        seg_model.load_ade20k_model(args.seg_model)
+        print(f"Segmentation: loaded {args.seg_model}; attack will be mask-constrained")
+
     video       = load_video(args.dataset, args.video)
     image_files = video['image_files']
     gt          = video['gt']
@@ -570,10 +642,20 @@ def run(args):
             att_np = np.resize(att_np, (1, x_crop.shape[1], x_crop.shape[2], x_crop.shape[3]))
             x_crop_init = torch.clamp(x_crop + torch.from_numpy(att_np).cuda(), 0, 255)
 
+        # --- Optional: segmentation mask in search-crop coords ---
+        attack_mask_t = None
+        seg_util = float('nan')
+        if seg_model is not None:
+            mask_full, seg_util = _seg_fn(seg_model, image_files[f])
+            attack_mask_t = crop_mask_to_search(
+                mask_full, target_pos, round(s_x), p.instance_size
+            )
+
         x_adv   = rtaa_attack(
             net, x_crop_init, x_crop, prev_pred_bbox,
             target_pos, target_sz, scale_z, p,
             iteration=5, final_pos=final_pos, im_bounds=im_bounds,
+            attack_mask=attack_mask_t,
         )
         att_per = x_adv - x_crop
 
@@ -588,7 +670,11 @@ def run(args):
         masked_hyps = run_masked_hypotheses(net, x_adv, state, scale_z, masks)
 
         # --- Main forward pass (updates state to adversarial top-1) ---
-        im_attacked = inject_perturbation(im, att_per, target_pos, s_x)
+        im_attacked = inject_perturbation(
+            im, att_per, target_pos, s_x,
+            attack_mask=attack_mask_t,
+            clip_negatives=args.clip_negatives,
+        )
         pred_bbox, _ = run_siamrpn_forward(net, x_adv, state, scale_z)
 
         # --- Stage 0.5: cluster masked hypotheses ---
@@ -617,6 +703,10 @@ def run(args):
         gt_sift   = sift_local_score(detector, prev_frame, im_attacked, prev_gt_bbox,   gt[f])
         pred_sift = sift_local_score(detector, prev_frame, im_attacked, prev_pred_bbox, pred_bbox)
 
+        # Segmentation mask in crop coords (None when --use_segmentation is off)
+        seg_mask_np = (attack_mask_t.detach().squeeze(0).squeeze(0).cpu().numpy()
+                       if attack_mask_t is not None else None)
+
         attack_log.append({
             'frame_idx':     f,
             'pred_bbox':     pred_bbox.copy(),
@@ -631,6 +721,9 @@ def run(args):
             'perturb_cov':   perturb_cov,
             # cluster data
             'clusters':      clusters,
+            # segmentation (NaN-filled when not in use)
+            'seg_mask':      seg_mask_np,
+            'seg_util':      float(seg_util),
         })
 
         prev_frame     = im_attacked
@@ -684,6 +777,15 @@ def run(args):
         cl_iou_gt[ti]  = ig
         cl_pscores[ti] = ps
 
+    # segmentation arrays (only populated when --use_segmentation; NaN otherwise)
+    if seg_model is not None:
+        attack_seg_masks = np.stack(
+            [e['seg_mask'].astype(np.float32) for e in attack_log]
+        )                                                       # (NF, H_crop, W_crop)
+    else:
+        attack_seg_masks = np.full((NF, crop_h, crop_w), np.nan, dtype=np.float32)
+    attack_seg_util = np.array([e['seg_util'] for e in attack_log], dtype=np.float32)
+
     log_stem = getattr(args, 'out_stem', None) or f"log_masked_{args.video}"
     log_path = join(args.out_dir, f"{log_stem}.npz")
     np.savez(
@@ -721,6 +823,11 @@ def run(args):
         attack_cluster_votes  = cl_votes,              # (NF, K)
         attack_cluster_iou_gt = cl_iou_gt,             # (NF, K)
         attack_cluster_pscore = cl_pscores,            # (NF, K)
+        # --- segmentation (NaN-filled when --use_segmentation is off) ---
+        use_segmentation  = np.array(bool(seg_model is not None)),
+        clip_negatives    = np.array(bool(args.clip_negatives)),
+        attack_seg_masks  = attack_seg_masks,          # (NF, H_crop, W_crop)
+        attack_seg_util   = attack_seg_util,           # (NF,) fraction of kosher pixels
     )
     print(f"\nLog  → {log_path}")
 
@@ -777,6 +884,17 @@ def main():
     parser.add_argument('--n_frames',  type=int, default=5,
                         help='Number of simulation frames after init')
     parser.add_argument('--seed',      type=int, default=None)
+    parser.add_argument('--clip_negatives', action='store_true',
+                        help='Zero out negative perturbation values in the rendered '
+                             'image (matches test_hijack_attack.py; render-only — '
+                             'the tracker still sees the signed perturbation)')
+    parser.add_argument('--use_segmentation', action='store_true',
+                        help='Constrain the RTAA optimization to ADE20K-segmented '
+                             '"kosher" regions (walls, buildings, roads, signs, ...). '
+                             'Affects both the attack and the rendered image.')
+    parser.add_argument('--seg_model', default='deeplabv3_xception65_ade20k.h5',
+                        help='Path to ADE20K segmentation model weights '
+                             '(required when --use_segmentation is set)')
     args = parser.parse_args()
 
     if args.seed is None:
