@@ -174,8 +174,8 @@ class TrackerConfig(object):
 def rtaa_attack(net, x_init, x, gt, target_pos, target_sz, scale_z, p,
                 eps=150, alpha=1, iteration=200, x_val_min=0, x_val_max=255,
                 final_pos=None, im_bounds=None,
-                pscore_weight=10.0,
-                pseudo_iou_thresh=0.4, truth_suppress_iou_thresh=0.3,
+                pscore_weight=50.0,
+                pseudo_iou_thresh=0.1, truth_suppress_iou_thresh=0.1,
                 attack_mask=None):
     """RTAA attack with a pscore-targeted objective.
 
@@ -334,6 +334,8 @@ def rtaa_attack(net, x_init, x, gt, target_pos, target_sz, scale_z, p,
 
         pseudo_mask = torch.from_numpy((label_pseudo > pseudo_iou_thresh).astype(np.float32)).cuda()
         truth_mask = torch.from_numpy((label > truth_suppress_iou_thresh).astype(np.float32)).cuda()
+        # print(f"Iter {i+1}: {pseudo_mask.sum().item()} anchors in pseudo mask, "
+        #       f"{truth_mask.sum().item()} anchors in truth mask")
         n_p = pseudo_mask.sum().clamp_min(1.0)
         n_t = truth_mask.sum().clamp_min(1.0)
 
@@ -343,6 +345,9 @@ def rtaa_attack(net, x_init, x, gt, target_pos, target_sz, scale_z, p,
 
         # final adversarial loss
         loss = loss_cls + loss_reg + loss_pscore
+        # print(f"Iter {i+1}/{iteration}: L_cls={loss_cls.item():.4f}, "
+        #       f"L_reg={loss_reg.item():.4f}, L_pscore={loss_pscore.item():.4f}, "
+        #       f"L_total={loss.item():.4f}")
 
         # calculate the derivative
         net.zero_grad()
@@ -368,8 +373,8 @@ def rtaa_sift_attack(net, x_init, x, gt, target_pos, target_sz, scale_z, p,
                      r_target_crop_bbox,
                      eps=10, iteration=5, x_val_min=0, x_val_max=255,
                      final_pos=None, im_bounds=None,
-                     pscore_weight=10.0,
-                     pseudo_iou_thresh=0.4, truth_suppress_iou_thresh=0.3,
+                     pscore_weight=50.0,
+                     pseudo_iou_thresh=0.1, truth_suppress_iou_thresh=0.1,
                      attack_mask=None,
                      alpha_dog=1000.0, gamma_kornia=0.0,
                      dog_contrast=0.04, kornia_num_features=500,

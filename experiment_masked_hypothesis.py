@@ -580,6 +580,10 @@ def run(args):
     M         = len(masks)
     K         = args.K_clusters
     mask_names_list = [name for _, name in masks]
+    if args.inject_gt_hypothesis:
+        # GT injection appends an extra hypothesis with no underlying mask.
+        # mask_names is M+1 long; masks_np stays (M, H, W).
+        mask_names_list.append('gt_inj')
     masks_np  = np.array([m for m, _ in masks])   # (M, H, W) bool
 
     print(f"Masks: {M} total  "
@@ -608,7 +612,10 @@ def run(args):
     # -----------------------------------------------------------------------
     print("\n--- Attack simulation ---")
     attack_log = []
-    state, prev_frame, prev_pred_bbox = init_tracker()
+    state, prev_frame, prev_defense_bbox = init_tracker()
+    # prev_defense_bbox = the DEFENSE's previous-iter top-1 (clusters[0]['bbox']
+    # after SIFT rerank). On the init frame the defense has not run yet, so
+    # we seed it with the init GT — same value as init_tracker's third return.
     prev_gt_bbox = gt[init_frame].copy()
 
     cx0 = state['target_pos'][0]
@@ -656,10 +663,10 @@ def run(args):
 
         if args.attack_variant == 'rtaa_sift':
             r_target_crop = frame_bbox_to_crop_bbox(
-                prev_pred_bbox, target_pos, s_x, p.instance_size
+                prev_defense_bbox, target_pos, s_x, p.instance_size
             )
             x_adv = rtaa_sift_attack(
-                net, x_crop_init, x_crop, prev_pred_bbox,
+                net, x_crop_init, x_crop, prev_defense_bbox,
                 target_pos, target_sz, scale_z, p,
                 r_target_crop_bbox=r_target_crop,
                 eps=args.eps, iteration=args.n_iter,
@@ -671,7 +678,7 @@ def run(args):
             )
         else:
             x_adv = rtaa_attack(
-                net, x_crop_init, x_crop, prev_pred_bbox,
+                net, x_crop_init, x_crop, prev_defense_bbox,
                 target_pos, target_sz, scale_z, p,
                 eps=args.eps, iteration=args.n_iter,
                 final_pos=final_pos, im_bounds=im_bounds,
@@ -689,6 +696,19 @@ def run(args):
         # --- Stage 0: masked hypotheses (BEFORE state update) ---
         masked_hyps = run_masked_hypotheses(net, x_adv, state, scale_z, masks)
 
+        # --- Optional GT injection (oracle diagnostic) ---
+        # Appends GT bbox to the hypothesis pool. Lets us isolate SIFT-rerank
+        # behavior: when GT is guaranteed to be in the pool, max_pool_iou=1.0
+        # so ranking_eff_sift = top_sift_iou. If SIFT picks GT under benign
+        # but not under attack, the attack broke the SIFT signal specifically.
+        if args.inject_gt_hypothesis:
+            masked_hyps.append({
+                'name':          'gt_inj',
+                'bbox':          np.array(gt[f], dtype=np.float32),
+                'pscore':        1.0,
+                'siamrpn_score': 1.0,
+            })
+
         # --- Main forward pass (updates state to adversarial top-1) ---
         im_attacked = inject_perturbation(
             im, att_per, target_pos, s_x,
@@ -701,19 +721,24 @@ def run(args):
         clusters = cluster_hypotheses(masked_hyps, iou_eps=args.cluster_iou_eps)
 
         # --- Perturbation coverage per mask ---
+        # NaN-pad the injected-GT entry: it has no mask, so coverage is undefined.
         perturb_cov = compute_perturbation_coverages(att_per_np_chw, masks)
+        if args.inject_gt_hypothesis:
+            perturb_cov.append(float('nan'))
 
         # --- Annotate each masked hypothesis with IoU-GT and SIFT ---
+        # SIFT reference = prev_defense_bbox (defense's previous-iter top-1),
+        # consistent with what a real white-box-aware defense would use.
         for mh in masked_hyps:
             mh['iou_gt']    = _bbox_iou(mh['bbox'], gt[f])
             mh['sift_score'] = sift_local_score(
-                detector, prev_frame, im_attacked, prev_pred_bbox, mh['bbox']
+                detector, prev_frame, im_attacked, prev_defense_bbox, mh['bbox']
             )
 
         # --- Annotate each cluster rep with SIFT and IoU-GT ---
         for cl in clusters:
             cl['sift_score'] = sift_local_score(
-                detector, prev_frame, im_attacked, prev_pred_bbox, cl['bbox']
+                detector, prev_frame, im_attacked, prev_defense_bbox, cl['bbox']
             )
             cl['iou_gt'] = _bbox_iou(cl['bbox'], gt[f])
 
@@ -721,7 +746,7 @@ def run(args):
 
         # --- Baselines ---
         gt_sift   = sift_local_score(detector, prev_frame, im_attacked, prev_gt_bbox,   gt[f])
-        pred_sift = sift_local_score(detector, prev_frame, im_attacked, prev_pred_bbox, pred_bbox)
+        pred_sift = sift_local_score(detector, prev_frame, im_attacked, prev_defense_bbox, pred_bbox)
 
         # Segmentation mask in crop coords (None when --use_segmentation is off)
         seg_mask_np = (attack_mask_t.detach().squeeze(0).squeeze(0).cpu().numpy()
@@ -748,9 +773,12 @@ def run(args):
             'sift_loss_log': sift_loss_log,
         })
 
-        prev_frame     = im_attacked
-        prev_pred_bbox = pred_bbox
-        prev_gt_bbox   = gt[f].copy()
+        prev_frame = im_attacked
+        # Rollforward R_target to the DEFENSE's top-1, not the tracker's
+        # (hijacked) pscore top-1. clusters is non-empty: M masked hyps + 4
+        # quadrant hyps guarantee >= 1 cluster.
+        prev_defense_bbox = np.asarray(clusters[0]['bbox'], dtype=np.float32)
+        prev_gt_bbox = gt[f].copy()
 
     # -----------------------------------------------------------------------
     # Flatten logs → numpy arrays and save .npz
@@ -874,6 +902,7 @@ def run(args):
         alpha_dog         = np.array(args.alpha_dog, dtype=np.float32),
         gamma_kornia      = np.array(args.gamma_kornia, dtype=np.float32),
         dog_contrast      = np.array(args.dog_contrast, dtype=np.float32),
+        inject_gt_hypothesis = np.array(bool(args.inject_gt_hypothesis)),
         sift_loss_rtaa    = sift_loss_rtaa,
         sift_loss_dog     = sift_loss_dog,
         sift_loss_kornia  = sift_loss_kornia,
@@ -965,6 +994,12 @@ def main():
     parser.add_argument('--dog_contrast', type=float, default=0.04,
                         help='Contrast threshold below which |DoG| is unpenalised '
                              '(matches OpenCV cv2.SIFT_create contrastThreshold)')
+    parser.add_argument('--inject_gt_hypothesis', action='store_true',
+                        help='Append GT bbox to the masked-hypothesis pool as an '
+                             'oracle diagnostic. With GT guaranteed in the pool, '
+                             'max_pool_iou = 1.0, so ranking_eff_sift = top_sift_iou. '
+                             'Isolates whether the SIFT reranker picks GT under '
+                             'attack vs benign.')
     args = parser.parse_args()
 
     if args.seed is None:

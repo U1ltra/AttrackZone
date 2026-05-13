@@ -37,6 +37,7 @@ Usage
 
   # Vanilla RTAA baseline at the new eps=10 threat model
   python experiment_sweep.py --attack_variant rtaa --eps 10 --out_dir out/sweep_eps10
+  python experiment_sweep.py --attack_variant rtaa --eps 10 --n_iter 10 --out_dir out/sweep_eps10 --videos car1 racing --n_seeds 20
 
   # Adaptive attack: RTAA + DoG suppress (zero-gap term only)
   python experiment_sweep.py --attack_variant rtaa_sift --eps 10 \
@@ -152,18 +153,26 @@ def list_videos(dataset_name, data_dir):
 # Run one experiment and return its log path
 # ---------------------------------------------------------------------------
 
+def _variant_tag(attack_variant, alpha_dog, gamma_kornia, inject_gt_hypothesis):
+    """Stem suffix encoding attack config so logs don't clobber across sweeps."""
+    base = (attack_variant if attack_variant == 'rtaa'
+            else f"{attack_variant}_a{int(alpha_dog)}_g{gamma_kornia:.2f}")
+    return base + ('_gtinj' if inject_gt_hypothesis else '')
+
+
 def run_experiment(video, seed, out_dir, N_masks, cluster_iou_eps, model,
-                   attack_variant, eps, n_iter, alpha_dog, gamma_kornia):
+                   attack_variant, eps, n_iter, alpha_dog, gamma_kornia,
+                   inject_gt_hypothesis):
     """
     Call experiment_masked_hypothesis.py as a subprocess.
     Returns the path to the output log, or None on failure.
 
-    The log stem encodes attack_variant and eps so that paired-comparison
-    sweeps (vanilla RTAA vs RTAA+SIFT) don't clobber each other's logs.
+    The log stem encodes attack_variant, eps, and gt-injection flag so
+    paired-comparison sweeps don't clobber each other's logs.
     """
-    variant_tag = (attack_variant if attack_variant == 'rtaa'
-                   else f"{attack_variant}_a{int(alpha_dog)}_g{gamma_kornia:.2f}")
-    stem     = f"log_masked_{video}_s{seed}_{variant_tag}_eps{int(eps)}"
+    tag      = _variant_tag(attack_variant, alpha_dog, gamma_kornia,
+                            inject_gt_hypothesis)
+    stem     = f"log_masked_{video}_s{seed}_{tag}_eps{int(eps)}"
     log_path = join(out_dir, f"{stem}.npz")
     if os.path.exists(log_path):
         return log_path   # already done — skip
@@ -185,6 +194,8 @@ def run_experiment(video, seed, out_dir, N_masks, cluster_iou_eps, model,
         '--alpha_dog',      str(alpha_dog),
         '--gamma_kornia',   str(gamma_kornia),
     ]
+    if inject_gt_hypothesis:
+        cmd.append('--inject_gt_hypothesis')
     result = subprocess.run(cmd, capture_output=True, text=True)
     if result.returncode != 0:
         print(f"  FAILED: {video} seed={seed}")
@@ -228,6 +239,8 @@ def main():
                         help='DoG-suppress loss weight (rtaa_sift only)')
     parser.add_argument('--gamma_kornia', type=float, default=0.0,
                         help='Kornia-SIFT BPDA surrogate weight (rtaa_sift only)')
+    parser.add_argument('--inject_gt_hypothesis', action='store_true',
+                        help='Append GT bbox to the hypothesis pool (oracle diagnostic).')
     args = parser.parse_args()
 
     data_dir = join(dirname(realpath(__file__)), 'data')
@@ -252,17 +265,16 @@ def main():
         print(f"\n{'─'*60}")
         print(f"Video: {video}")
         for seed in seeds:
-            variant_tag = (args.attack_variant if args.attack_variant == 'rtaa'
-                           else f"{args.attack_variant}"
-                                f"_a{int(args.alpha_dog)}_g{args.gamma_kornia:.2f}")
-            expected_stem = (f"log_masked_{video}_s{seed}_"
-                             f"{variant_tag}_eps{int(args.eps)}")
+            tag = _variant_tag(args.attack_variant, args.alpha_dog,
+                               args.gamma_kornia, args.inject_gt_hypothesis)
+            expected_stem = f"log_masked_{video}_s{seed}_{tag}_eps{int(args.eps)}"
             if not args.analyse_only:
                 log_path = run_experiment(
                     video, seed, args.out_dir,
                     args.N_masks, args.cluster_iou_eps, args.model,
                     args.attack_variant, args.eps, args.n_iter,
                     args.alpha_dog, args.gamma_kornia,
+                    args.inject_gt_hypothesis,
                 )
             else:
                 log_path = join(args.out_dir, f"{expected_stem}.npz")
