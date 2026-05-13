@@ -34,6 +34,18 @@ Usage
 
   # Skip experiment runs and just re-analyse existing logs
   python experiment_sweep.py --analyse_only
+
+  # Vanilla RTAA baseline at the new eps=10 threat model
+  python experiment_sweep.py --attack_variant rtaa --eps 10 --out_dir out/sweep_eps10
+
+  # Adaptive attack: RTAA + DoG suppress (zero-gap term only)
+  python experiment_sweep.py --attack_variant rtaa_sift --eps 10 \
+    --alpha_dog 1000 --gamma_kornia 0 --out_dir out/sweep_eps10
+
+  # Adaptive attack with both terms
+  python experiment_sweep.py --attack_variant rtaa_sift --eps 10 \
+    --alpha_dog 1000 --gamma_kornia 1.0 --out_dir out/sweep_eps10
+
 """
 
 import argparse
@@ -140,12 +152,18 @@ def list_videos(dataset_name, data_dir):
 # Run one experiment and return its log path
 # ---------------------------------------------------------------------------
 
-def run_experiment(video, seed, out_dir, N_masks, cluster_iou_eps, model):
+def run_experiment(video, seed, out_dir, N_masks, cluster_iou_eps, model,
+                   attack_variant, eps, n_iter, alpha_dog, gamma_kornia):
     """
     Call experiment_masked_hypothesis.py as a subprocess.
     Returns the path to the output log, or None on failure.
+
+    The log stem encodes attack_variant and eps so that paired-comparison
+    sweeps (vanilla RTAA vs RTAA+SIFT) don't clobber each other's logs.
     """
-    stem     = f"log_masked_{video}_s{seed}"
+    variant_tag = (attack_variant if attack_variant == 'rtaa'
+                   else f"{attack_variant}_a{int(alpha_dog)}_g{gamma_kornia:.2f}")
+    stem     = f"log_masked_{video}_s{seed}_{variant_tag}_eps{int(eps)}"
     log_path = join(out_dir, f"{stem}.npz")
     if os.path.exists(log_path):
         return log_path   # already done — skip
@@ -153,14 +171,19 @@ def run_experiment(video, seed, out_dir, N_masks, cluster_iou_eps, model):
     cmd = [
         sys.executable,
         join(dirname(realpath(__file__)), 'experiment_masked_hypothesis.py'),
-        '--video',    video,
-        '--seed',     str(seed),
-        '--out_dir',  out_dir,
-        '--out_stem', stem,
-        '--N_masks',  str(N_masks),
-        '--n_frames', '1',
+        '--video',          video,
+        '--seed',           str(seed),
+        '--out_dir',        out_dir,
+        '--out_stem',       stem,
+        '--N_masks',        str(N_masks),
+        '--n_frames',       '1',
         '--cluster_iou_eps', str(cluster_iou_eps),
-        '--model',    model,
+        '--model',          model,
+        '--attack_variant', attack_variant,
+        '--eps',            str(eps),
+        '--n_iter',         str(n_iter),
+        '--alpha_dog',      str(alpha_dog),
+        '--gamma_kornia',   str(gamma_kornia),
     ]
     result = subprocess.run(cmd, capture_output=True, text=True)
     if result.returncode != 0:
@@ -194,6 +217,17 @@ def main():
     parser.add_argument('--out_dir',    default='out/sweep')
     parser.add_argument('--analyse_only', action='store_true',
                         help='Skip running experiments; just analyse existing logs')
+    parser.add_argument('--attack_variant', default='rtaa',
+                        choices=['rtaa', 'rtaa_sift'],
+                        help='Vanilla RTAA, or RTAA augmented with SIFT-evasion')
+    parser.add_argument('--eps',          type=float, default=10.0,
+                        help='L_inf perturbation budget (default 10).')
+    parser.add_argument('--n_iter',       type=int,   default=5,
+                        help='PGD iterations inside the attack loop')
+    parser.add_argument('--alpha_dog',    type=float, default=1000.0,
+                        help='DoG-suppress loss weight (rtaa_sift only)')
+    parser.add_argument('--gamma_kornia', type=float, default=0.0,
+                        help='Kornia-SIFT BPDA surrogate weight (rtaa_sift only)')
     args = parser.parse_args()
 
     data_dir = join(dirname(realpath(__file__)), 'data')
@@ -218,13 +252,20 @@ def main():
         print(f"\n{'─'*60}")
         print(f"Video: {video}")
         for seed in seeds:
+            variant_tag = (args.attack_variant if args.attack_variant == 'rtaa'
+                           else f"{args.attack_variant}"
+                                f"_a{int(args.alpha_dog)}_g{args.gamma_kornia:.2f}")
+            expected_stem = (f"log_masked_{video}_s{seed}_"
+                             f"{variant_tag}_eps{int(args.eps)}")
             if not args.analyse_only:
                 log_path = run_experiment(
                     video, seed, args.out_dir,
-                    args.N_masks, args.cluster_iou_eps, args.model
+                    args.N_masks, args.cluster_iou_eps, args.model,
+                    args.attack_variant, args.eps, args.n_iter,
+                    args.alpha_dog, args.gamma_kornia,
                 )
             else:
-                log_path = join(args.out_dir, f"log_masked_{video}_s{seed}.npz")
+                log_path = join(args.out_dir, f"{expected_stem}.npz")
 
             if log_path is None or not os.path.exists(log_path):
                 print(f"  seed={seed}  MISSING")

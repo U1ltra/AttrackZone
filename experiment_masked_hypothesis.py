@@ -68,9 +68,10 @@ from torch.autograd import Variable
 from tqdm import tqdm
 
 from net import SiamRPNvot
-from run_attack import SiamRPN_init, rtaa_attack
+from run_attack import SiamRPN_init, rtaa_attack, rtaa_sift_attack
 from utils import rect_2_cxy_wh, cxy_wh_2_rect, get_subwindow_tracking
 from sift_alignment import SIFTAlignmentDetector
+from sift_attack import frame_bbox_to_crop_bbox
 
 
 # ---------------------------------------------------------------------------
@@ -651,12 +652,31 @@ def run(args):
                 mask_full, target_pos, round(s_x), p.instance_size
             )
 
-        x_adv   = rtaa_attack(
-            net, x_crop_init, x_crop, prev_pred_bbox,
-            target_pos, target_sz, scale_z, p,
-            iteration=5, final_pos=final_pos, im_bounds=im_bounds,
-            attack_mask=attack_mask_t,
-        )
+        sift_loss_log = {} if args.attack_variant == 'rtaa_sift' else None
+
+        if args.attack_variant == 'rtaa_sift':
+            r_target_crop = frame_bbox_to_crop_bbox(
+                prev_pred_bbox, target_pos, s_x, p.instance_size
+            )
+            x_adv = rtaa_sift_attack(
+                net, x_crop_init, x_crop, prev_pred_bbox,
+                target_pos, target_sz, scale_z, p,
+                r_target_crop_bbox=r_target_crop,
+                eps=args.eps, iteration=args.n_iter,
+                final_pos=final_pos, im_bounds=im_bounds,
+                attack_mask=attack_mask_t,
+                alpha_dog=args.alpha_dog, gamma_kornia=args.gamma_kornia,
+                dog_contrast=args.dog_contrast,
+                loss_log=sift_loss_log,
+            )
+        else:
+            x_adv = rtaa_attack(
+                net, x_crop_init, x_crop, prev_pred_bbox,
+                target_pos, target_sz, scale_z, p,
+                eps=args.eps, iteration=args.n_iter,
+                final_pos=final_pos, im_bounds=im_bounds,
+                attack_mask=attack_mask_t,
+            )
         att_per = x_adv - x_crop
 
         # --- Crop-space arrays for analysis ---
@@ -724,6 +744,8 @@ def run(args):
             # segmentation (NaN-filled when not in use)
             'seg_mask':      seg_mask_np,
             'seg_util':      float(seg_util),
+            # SIFT-attack diagnostics (only populated when --attack_variant rtaa_sift)
+            'sift_loss_log': sift_loss_log,
         })
 
         prev_frame     = im_attacked
@@ -786,6 +808,23 @@ def run(args):
         attack_seg_masks = np.full((NF, crop_h, crop_w), np.nan, dtype=np.float32)
     attack_seg_util = np.array([e['seg_util'] for e in attack_log], dtype=np.float32)
 
+    # SIFT-attack per-iter loss traces (NF, n_iter) — NaN when variant != rtaa_sift
+    if args.attack_variant == 'rtaa_sift':
+        def _stack(key):
+            arr = np.full((NF, args.n_iter), np.nan, dtype=np.float32)
+            for ti, e in enumerate(attack_log):
+                vals = e['sift_loss_log'].get(key, [])
+                arr[ti, :len(vals)] = vals
+            return arr
+        sift_loss_rtaa   = _stack('L_rtaa')
+        sift_loss_dog    = _stack('L_dog')
+        sift_loss_kornia = _stack('L_kornia')
+        sift_loss_total  = _stack('L_total')
+    else:
+        sift_loss_rtaa = sift_loss_dog = sift_loss_kornia = sift_loss_total = (
+            np.full((NF, args.n_iter), np.nan, dtype=np.float32)
+        )
+
     log_stem = getattr(args, 'out_stem', None) or f"log_masked_{args.video}"
     log_path = join(args.out_dir, f"{log_stem}.npz")
     np.savez(
@@ -828,6 +867,17 @@ def run(args):
         clip_negatives    = np.array(bool(args.clip_negatives)),
         attack_seg_masks  = attack_seg_masks,          # (NF, H_crop, W_crop)
         attack_seg_util   = attack_seg_util,           # (NF,) fraction of kosher pixels
+        # --- attack-variant metadata + SIFT-attack diagnostics ---
+        attack_variant    = np.array(args.attack_variant),
+        eps               = np.array(args.eps, dtype=np.float32),
+        n_iter            = np.array(args.n_iter, dtype=np.int32),
+        alpha_dog         = np.array(args.alpha_dog, dtype=np.float32),
+        gamma_kornia      = np.array(args.gamma_kornia, dtype=np.float32),
+        dog_contrast      = np.array(args.dog_contrast, dtype=np.float32),
+        sift_loss_rtaa    = sift_loss_rtaa,
+        sift_loss_dog     = sift_loss_dog,
+        sift_loss_kornia  = sift_loss_kornia,
+        sift_loss_total   = sift_loss_total,
     )
     print(f"\nLog  → {log_path}")
 
@@ -895,6 +945,26 @@ def main():
     parser.add_argument('--seg_model', default='deeplabv3_xception65_ade20k.h5',
                         help='Path to ADE20K segmentation model weights '
                              '(required when --use_segmentation is set)')
+    parser.add_argument('--attack_variant', default='rtaa',
+                        choices=['rtaa', 'rtaa_sift'],
+                        help='Vanilla RTAA, or RTAA augmented with SIFT-evasion '
+                             'loss terms (DoG-suppress + optional Kornia surrogate)')
+    parser.add_argument('--eps', type=float, default=10.0,
+                        help='L_inf perturbation budget on the search crop '
+                             '(default 10 — the published threat model). '
+                             'Set higher only for budget studies.')
+    parser.add_argument('--n_iter', type=int, default=5,
+                        help='PGD iterations inside the attack loop')
+    parser.add_argument('--alpha_dog', type=float, default=1000.0,
+                        help='Weight on the zero-gap DoG-suppress loss term '
+                             '(rtaa_sift variant only)')
+    parser.add_argument('--gamma_kornia', type=float, default=0.0,
+                        help='Weight on the BPDA-surrogate Kornia-SIFT '
+                             'suppress loss term (rtaa_sift variant only; '
+                             'default 0 — enable only if DoG alone is insufficient)')
+    parser.add_argument('--dog_contrast', type=float, default=0.04,
+                        help='Contrast threshold below which |DoG| is unpenalised '
+                             '(matches OpenCV cv2.SIFT_create contrastThreshold)')
     args = parser.parse_args()
 
     if args.seed is None:
