@@ -270,6 +270,48 @@ def _bbox_iou(a, b):
     return float(inter / union) if union > 0 else 0.
 
 
+def _target_pseudo_box(prev_defense_bbox, target_pos, target_sz,
+                       final_pos, im_bounds):
+    """Reconstruct the pseudo box rtaa_attack uses as its attract target.
+
+    Mirrors the formula at run_attack.py rtaa_attack so analysis can read pscore
+    on exactly the anchor set the attack optimizes over. Returns box in frame
+    coords as [x, y, w, h].
+
+    Note: when final_pos preserves the original size (final_pos[2:4] ==
+    target_sz), rate_wd evaluates to 0, collapsing the pseudo box to zero area.
+    That matches rtaa_attack's behavior on the first attack frame, where the
+    pseudo-attract loss term is effectively disabled.
+    """
+    rate_xy1 = (final_pos[0] - target_pos[0]) / im_bounds[0]
+    rate_xy2 = (final_pos[1] - target_pos[1]) / im_bounds[1]
+    max_change = max(abs(final_pos[2] - target_sz[0]),
+                     abs(final_pos[3] - target_sz[1]))
+    if max_change == abs(final_pos[2] - target_sz[0]):
+        rate_wd = (final_pos[2] - target_sz[0]) / im_bounds[0]
+    else:
+        rate_wd = (final_pos[3] - target_sz[1]) / im_bounds[1]
+    g = prev_defense_bbox
+    return np.array([
+        g[0] + rate_xy1 * g[2],
+        g[1] + rate_xy2 * g[3],
+        g[2] * rate_wd,
+        g[3] * rate_wd,
+    ], dtype=np.float32)
+
+
+def _bbox_to_image_mask(frame_shape, bbox):
+    """Build a uint8 mask (255 inside bbox, 0 outside) for SIFT detectAndCompute."""
+    H, W = frame_shape[:2]
+    x, y, w, h = [int(round(v)) for v in bbox]
+    m = np.zeros((H, W), dtype=np.uint8)
+    x0, y0 = max(0, x),       max(0, y)
+    x1, y1 = max(0, min(W, x + w)), max(0, min(H, y + h))
+    if x1 > x0 and y1 > y0:
+        m[y0:y1, x0:x1] = 255
+    return m
+
+
 def cluster_hypotheses(hyp_list, iou_eps=0.5):
     """
     Cluster masked hypotheses by IoU distance using DBSCAN.
@@ -715,7 +757,35 @@ def run(args):
             attack_mask=attack_mask_t,
             clip_negatives=args.clip_negatives,
         )
-        pred_bbox, _ = run_siamrpn_forward(net, x_adv, state, scale_z)
+        pred_bbox, all_hyps = run_siamrpn_forward(net, x_adv, state, scale_z)
+
+        # === Attack-loss diagnostics in evaluation (pscore) space =============
+        # Read pscore on the *exact* anchor subsets rtaa_attack optimizes over,
+        # using the same IoU threshold (0.1) as truth_suppress_iou_thresh /
+        # pseudo_iou_thresh in run_attack.py. Tracker is argmax-driven, so the
+        # attack hijacks the top-1 iff pscore_pseudo_max > pscore_truth_max.
+        pseudo_box = _target_pseudo_box(
+            prev_defense_bbox, target_pos, target_sz, final_pos, im_bounds
+        )
+        pseudo_valid = (pseudo_box[2] > 0) and (pseudo_box[3] > 0)
+        truth_pscores  = []
+        pseudo_pscores = []
+        for h in all_hyps:
+            if _bbox_iou(h['bbox'], prev_defense_bbox) > 0.1:
+                truth_pscores.append(h['pscore'])
+            if pseudo_valid and _bbox_iou(h['bbox'], pseudo_box) > 0.1:
+                pseudo_pscores.append(h['pscore'])
+        pscore_truth_max  = float(max(truth_pscores))  if truth_pscores  else float('nan')
+        pscore_pseudo_max = float(max(pseudo_pscores)) if pseudo_pscores else float('nan')
+        pred_pscore       = float(max(h['pscore'] for h in all_hyps))
+
+        # === Removal rate: SIFT keypoint count in prev_defense_bbox ROI =======
+        # Clean `im` vs perturbed `im_attacked` — directly probes the upstream
+        # signal the DoG-suppress / Kornia-suppress losses are designed to wipe.
+        roi_mask     = _bbox_to_image_mask(im.shape, prev_defense_bbox)
+        kp_clean     = len(detector.extract_features(im,          mask=roi_mask)[0])
+        kp_attacked  = len(detector.extract_features(im_attacked, mask=roi_mask)[0])
+        removal_rate = 1.0 - kp_attacked / max(kp_clean, 1)
 
         # --- Stage 0.5: cluster masked hypotheses ---
         clusters = cluster_hypotheses(masked_hyps, iou_eps=args.cluster_iou_eps)
@@ -771,6 +841,14 @@ def run(args):
             'seg_util':      float(seg_util),
             # SIFT-attack diagnostics (only populated when --attack_variant rtaa_sift)
             'sift_loss_log': sift_loss_log,
+            # attack-loss diagnostics (in evaluation space, on x_adv / im_attacked)
+            'pseudo_box':        pseudo_box.copy(),
+            'pred_pscore':       pred_pscore,
+            'pscore_truth_max':  pscore_truth_max,
+            'pscore_pseudo_max': pscore_pseudo_max,
+            'kp_clean':          int(kp_clean),
+            'kp_attacked':       int(kp_attacked),
+            'removal_rate':      float(removal_rate),
         })
 
         prev_frame = im_attacked
@@ -907,6 +985,14 @@ def run(args):
         sift_loss_dog     = sift_loss_dog,
         sift_loss_kornia  = sift_loss_kornia,
         sift_loss_total   = sift_loss_total,
+        # --- attack-loss diagnostics (pscore-space + SIFT removal rate) ---
+        attack_pseudo_bboxes      = np.array([e['pseudo_box']        for e in attack_log], dtype=np.float32),
+        attack_pred_pscore        = np.array([e['pred_pscore']       for e in attack_log], dtype=np.float32),
+        attack_pscore_truth_max   = np.array([e['pscore_truth_max']  for e in attack_log], dtype=np.float32),
+        attack_pscore_pseudo_max  = np.array([e['pscore_pseudo_max'] for e in attack_log], dtype=np.float32),
+        attack_kp_clean           = np.array([e['kp_clean']          for e in attack_log], dtype=np.int32),
+        attack_kp_attacked        = np.array([e['kp_attacked']       for e in attack_log], dtype=np.int32),
+        attack_removal_rate       = np.array([e['removal_rate']      for e in attack_log], dtype=np.float32),
     )
     print(f"\nLog  → {log_path}")
 

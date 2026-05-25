@@ -35,6 +35,9 @@ Usage
   # Skip experiment runs and just re-analyse existing logs
   python experiment_sweep.py --analyse_only
 
+  # Re-aggregate existing multi-frame logs at frame 3
+  python experiment_sweep.py --analyse_only --frame 3
+
   # Vanilla RTAA baseline at the new eps=10 threat model
   python experiment_sweep.py --attack_variant rtaa --eps 10 --out_dir out/sweep_eps10
   python experiment_sweep.py --attack_variant rtaa --eps 10 --n_iter 10 --out_dir out/sweep_eps10 --videos car1 racing --n_seeds 20
@@ -63,9 +66,9 @@ import numpy as np
 # Metric computation from a single-frame log
 # ---------------------------------------------------------------------------
 
-def compute_metrics(log_path, iou_threshold=0.5):
+def compute_metrics(log_path, frame_idx=0, iou_threshold=0.5):
     """
-    Load a single experiment log and compute per-frame metrics.
+    Load a single experiment log and compute metrics at `frame_idx`.
 
     Returns a dict with:
       max_pool_iou       float  — best IoU achievable from mask hypothesis pool
@@ -78,11 +81,18 @@ def compute_metrics(log_path, iou_threshold=0.5):
       ranking_eff_pscore float  — top_pscore_iou / max_pool_iou (nan if pool too weak)
       pool_hit           bool   — max_pool_iou >= iou_threshold
       sift_hit           bool   — top_sift_iou >= iou_threshold
+
+    Raises IndexError if the log has fewer frames than `frame_idx + 1`.
     """
     d = np.load(log_path, allow_pickle=True)
 
-    # Only use frame 0 (n_frames=1 run)
-    fi = 0
+    n_frames = len(d['attack_gt_bboxes'])
+    if frame_idx >= n_frames:
+        raise IndexError(
+            f"requested frame {frame_idx} but log has only {n_frames} frames"
+        )
+
+    fi = frame_idx
     gt_bbox   = d['attack_gt_bboxes'][fi]
     pred_bbox = d['attack_pred_bboxes'][fi]
 
@@ -124,7 +134,7 @@ def compute_metrics(log_path, iou_threshold=0.5):
         eff_sift   = float('nan')
         eff_pscore = float('nan')
 
-    return {
+    out = {
         'max_pool_iou':       max_pool_iou,
         'top_sift_iou':       top_sift_iou,
         'top_pscore_iou':     top_pscore_iou,
@@ -136,6 +146,18 @@ def compute_metrics(log_path, iou_threshold=0.5):
         'pool_hit':           max_pool_iou >= iou_threshold,
         'sift_hit':           top_sift_iou >= iou_threshold,
     }
+
+    # --- Attack-loss diagnostics (present when log was written by an updated
+    # experiment_masked_hypothesis.py; older logs are read with NaN fallbacks).
+    def _scalar(key):
+        return float(d[key][fi]) if key in d.files else float('nan')
+    out['pred_pscore']        = _scalar('attack_pred_pscore')
+    out['pscore_truth_max']   = _scalar('attack_pscore_truth_max')
+    out['pscore_pseudo_max']  = _scalar('attack_pscore_pseudo_max')
+    out['removal_rate']       = _scalar('attack_removal_rate')
+    out['kp_clean']           = _scalar('attack_kp_clean')
+    out['kp_attacked']        = _scalar('attack_kp_attacked')
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -185,7 +207,7 @@ def run_experiment(video, seed, out_dir, N_masks, cluster_iou_eps, model,
         '--out_dir',        out_dir,
         '--out_stem',       stem,
         '--N_masks',        str(N_masks),
-        '--n_frames',       '1',
+        '--n_frames',       '5',
         '--cluster_iou_eps', str(cluster_iou_eps),
         '--model',          model,
         '--attack_variant', attack_variant,
@@ -241,6 +263,15 @@ def main():
                         help='Kornia-SIFT BPDA surrogate weight (rtaa_sift only)')
     parser.add_argument('--inject_gt_hypothesis', action='store_true',
                         help='Append GT bbox to the hypothesis pool (oracle diagnostic).')
+    parser.add_argument('--analyze_atk_loss', action='store_true',
+                        help='Print/save direct attack-objective metrics: '
+                             'pscore_truth_max, pscore_pseudo_max, pred_pscore, '
+                             'attack_pred_sift, and SIFT removal_rate over prev_defense_bbox.')
+    parser.add_argument('--frame', type=int, default=0,
+                        help='Frame index (0-based) within each per-run log to '
+                             'compute metrics at. Default 0 matches the original '
+                             'single-frame behaviour; pair with --analyse_only to '
+                             're-aggregate existing multi-frame sweeps.')
     args = parser.parse_args()
 
     data_dir = join(dirname(realpath(__file__)), 'data')
@@ -284,7 +315,11 @@ def main():
                 continue
 
             try:
-                m = compute_metrics(log_path, iou_threshold=args.iou_threshold)
+                m = compute_metrics(log_path, frame_idx=args.frame,
+                                    iou_threshold=args.iou_threshold)
+            except IndexError as e:
+                print(f"  seed={seed}  TOO_SHORT ({e})")
+                continue
             except Exception as e:
                 print(f"  seed={seed}  ERROR: {e}")
                 continue
@@ -302,7 +337,8 @@ def main():
                   f"PoolHit={int(m['pool_hit'])}")
 
         if video_results:
-            _print_video_summary(video, video_results, args.iou_threshold)
+            _print_video_summary(video, video_results, args.iou_threshold,
+                                 atk_loss=args.analyze_atk_loss)
 
     if not all_results:
         print("\nNo results collected.")
@@ -310,15 +346,17 @@ def main():
 
     # --- Aggregate across all videos ---
     print(f"\n{'='*60}")
-    print("AGGREGATE RESULTS")
+    print(f"AGGREGATE RESULTS  (frame {args.frame})")
     print(f"{'='*60}")
-    _print_aggregate(all_results, args.iou_threshold)
+    _print_aggregate(all_results, args.iou_threshold,
+                     atk_loss=args.analyze_atk_loss)
 
     # --- Save raw results ---
-    _save_results(all_results, args.out_dir, args.iou_threshold)
+    _save_results(all_results, args.out_dir, args.iou_threshold,
+                  atk_loss=args.analyze_atk_loss)
 
 
-def _print_video_summary(video, results, tau):
+def _print_video_summary(video, results, tau, atk_loss=False):
     n = len(results)
     pool_recall   = np.mean([r['pool_hit']       for r in results])
     sift_hit      = np.mean([r['sift_hit']       for r in results])
@@ -343,8 +381,58 @@ def _print_video_summary(video, results, tau):
           f"(mean TopSIFT_IoU={mean_top_sift:.3f})")
     print(f"            AttackPred_IoU (ref):  {mean_pred_iou:.3f}")
 
+    if atk_loss:
+        _print_atk_loss_block(results, indent='  ')
 
-def _print_aggregate(results, tau):
+
+def _print_atk_loss_block(results, indent=''):
+    """Direct readout of the attack objective: anchor-subset pscore + SIFT removal.
+
+    Each printed scalar is the mean ± std *across runs* of the per-run quantity.
+    The per-run quantity is itself an anchor-max (or kp count) on a single
+    attacked frame, recorded in the inner experiment's npz.
+    """
+    def _mu_sd(key):
+        vals = np.array([r[key] for r in results], dtype=np.float64)
+        n_valid = int(np.sum(~np.isnan(vals)))
+        return np.nanmean(vals), np.nanstd(vals), n_valid
+
+    pt, pt_sd, _      = _mu_sd('pscore_truth_max')
+    pp, pp_sd, pp_n   = _mu_sd('pscore_pseudo_max')
+    pr, pr_sd, _      = _mu_sd('pred_pscore')
+    ps, ps_sd, _      = _mu_sd('pred_sift_score')
+    gs, gs_sd, _      = _mu_sd('gt_sift_score')
+    rr, rr_sd, _      = _mu_sd('removal_rate')
+    kpc, kpc_sd, _    = _mu_sd('kp_clean')
+    kpa, kpa_sd, _    = _mu_sd('kp_attacked')
+
+    # Hijack rate: fraction of runs where pseudo_max > truth_max (Bernoulli,
+    # so std is sqrt(p(1-p))).
+    hijack_pairs = [(r['pscore_pseudo_max'], r['pscore_truth_max']) for r in results
+                    if not np.isnan(r['pscore_pseudo_max'])
+                    and not np.isnan(r['pscore_truth_max'])]
+    if hijack_pairs:
+        wins = np.array([p > t for p, t in hijack_pairs], dtype=np.float64)
+        hijack_rate = float(np.mean(wins))
+        hijack_sd   = float(np.std(wins))
+    else:
+        hijack_rate = hijack_sd = float('nan')
+
+    print(f"{indent}── Attack-loss diagnostics (mean ± std across runs) ────────")
+    print(f"{indent}  pscore_truth_max:        {pt:.4f} ± {pt_sd:.4f}   "
+          f"(lower = attack suppressed truth more)")
+    print(f"{indent}  pscore_pseudo_max:       {pp:.4f} ± {pp_sd:.4f}   "
+          f"(higher = attack pulled pseudo target more, n={pp_n} non-degenerate)")
+    print(f"{indent}  pred_pscore (top-1):     {pr:.4f} ± {pr_sd:.4f}")
+    print(f"{indent}  hijack_rate (pseudo>truth): {hijack_rate:.3f} ± {hijack_sd:.3f}  "
+          f"(n={len(hijack_pairs)})")
+    print(f"{indent}  attack_pred_sift_score:  {ps:.4f} ± {ps_sd:.4f}   "
+          f"(gt_sift ref={gs:.4f} ± {gs_sd:.4f})")
+    print(f"{indent}  removal_rate (kp drop):  {rr:.4f} ± {rr_sd:.4f}   "
+          f"(kp_clean={kpc:.1f} ± {kpc_sd:.1f} → kp_attacked={kpa:.1f} ± {kpa_sd:.1f})")
+
+
+def _print_aggregate(results, tau, atk_loss=False):
     n = len(results)
     pool_recall   = np.mean([r['pool_hit']       for r in results])
     sift_hit      = np.mean([r['sift_hit']       for r in results])
@@ -377,8 +465,12 @@ def _print_aggregate(results, tau):
     print(f"     Mean AttackPred IoU:      {mean_pred_iou:.3f}  "
           f"(corrupted tracker's output)")
 
+    if atk_loss:
+        print("")
+        _print_atk_loss_block(results, indent='   ')
 
-def _save_results(results, out_dir, tau):
+
+def _save_results(results, out_dir, tau, atk_loss=False):
     import csv
 
     # CSV
@@ -390,6 +482,11 @@ def _save_results(results, out_dir, tau):
         'pool_hit', 'sift_hit',
         'attack_pred_iou', 'gt_sift_score', 'pred_sift_score',
     ]
+    if atk_loss:
+        fieldnames += [
+            'pscore_truth_max', 'pscore_pseudo_max', 'pred_pscore',
+            'removal_rate', 'kp_clean', 'kp_attacked',
+        ]
     with open(csv_path, 'w', newline='') as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction='ignore')
         writer.writeheader()
@@ -398,8 +495,7 @@ def _save_results(results, out_dir, tau):
 
     # NPZ
     npz_path = join(out_dir, 'sweep_results.npz')
-    np.savez(
-        npz_path,
+    kwargs = dict(
         videos              = np.array([r['video']               for r in results]),
         seeds               = np.array([r['seed']                for r in results]),
         max_pool_iou        = np.array([r['max_pool_iou']        for r in results]),
@@ -414,6 +510,16 @@ def _save_results(results, out_dir, tau):
         pred_sift_score     = np.array([r['pred_sift_score']     for r in results]),
         iou_threshold       = np.array(tau),
     )
+    if atk_loss:
+        kwargs.update(
+            pscore_truth_max  = np.array([r['pscore_truth_max']  for r in results]),
+            pscore_pseudo_max = np.array([r['pscore_pseudo_max'] for r in results]),
+            pred_pscore       = np.array([r['pred_pscore']       for r in results]),
+            removal_rate      = np.array([r['removal_rate']      for r in results]),
+            kp_clean          = np.array([r['kp_clean']          for r in results]),
+            kp_attacked       = np.array([r['kp_attacked']       for r in results]),
+        )
+    np.savez(npz_path, **kwargs)
     print(f"NPZ  → {npz_path}")
 
 
