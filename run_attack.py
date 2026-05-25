@@ -211,18 +211,30 @@ def rtaa_attack(net, x_init, x, gt, target_pos, target_sz, scale_z, p,
 
     # Pseudo geometry tuned for max pscore: same size as truth (penalty ~= 1)
     # and a moderate displacement that stays inside the cosine window peak.
+    #
+    # Downstream, rate_xy and rate_wd are consumed as
+    #     pseudo_shift_px = rate_xy * gt_size_px
+    #     pseudo_size_px  = rate_wd * gt_size_px      (multiplicative ratio)
+    # so the final_pos→rate conversion normalizes by target_sz to match
+    # those semantics. Net effect: rate_xy*gt_w reproduces the requested
+    # pixel offset (final_pos - target_pos), and rate_wd is final_pos's
+    # size as a fraction of target_sz.
     if final_pos is None or im_bounds is None:
         rate_xy1 = 0.3
         rate_xy2 = 0.3
         rate_wd = 1.0
     else:
-        rate_xy1 = (final_pos[0] - target_pos[0]) / im_bounds[0]
-        rate_xy2 = (final_pos[1] - target_pos[1]) / im_bounds[1]
-        max_change = max(abs((final_pos[2] - target_sz[0])), abs((final_pos[3] - target_sz[1])))
-        if max_change == abs((final_pos[2] - target_sz[0])):
-            rate_wd = (final_pos[2] - target_sz[0]) / im_bounds[0]
-        else:
-            rate_wd = (final_pos[3] - target_sz[1]) / im_bounds[1]
+        rate_xy1 = (final_pos[0] - target_pos[0]) / target_sz[0]
+        rate_xy2 = (final_pos[1] - target_pos[1]) / target_sz[1]
+        rate_wd  = final_pos[2] / target_sz[0]
+
+        # rate_xy1 = (final_pos[0] - target_pos[0]) / im_bounds[0]
+        # rate_xy2 = (final_pos[1] - target_pos[1]) / im_bounds[1]
+        # max_change = max(abs((final_pos[2] - target_sz[0])), abs((final_pos[3] - target_sz[1])))
+        # if max_change == abs((final_pos[2] - target_sz[0])):
+        #     rate_wd = (final_pos[2] - target_sz[0]) / im_bounds[0]
+        # else:
+        #     rate_wd = (final_pos[3] - target_sz[1]) / im_bounds[1]
 
     # ---- static tensors used by the differentiable pscore term ----
     score_size_int = int(p.score_size)
@@ -344,7 +356,7 @@ def rtaa_attack(net, x_init, x, gt, target_pos, target_sz, scale_z, p,
         loss_pscore = (loss_pscore_pseudo + loss_pscore_truth) * pscore_weight
 
         # final adversarial loss
-        loss = loss_cls + loss_reg + loss_pscore
+        loss = (loss_cls + loss_reg) + loss_pscore
         # print(f"Iter {i+1}/{iteration}: L_cls={loss_cls.item():.4f}, "
         #       f"L_reg={loss_reg.item():.4f}, L_pscore={loss_pscore.item():.4f}, "
         #       f"L_total={loss.item():.4f}")
@@ -409,14 +421,18 @@ def rtaa_sift_attack(net, x_init, x, gt, target_pos, target_sz, scale_z, p,
     if final_pos is None or im_bounds is None:
         rate_xy1 = 0.3; rate_xy2 = 0.3; rate_wd = 1.0
     else:
-        rate_xy1 = (final_pos[0] - target_pos[0]) / im_bounds[0]
-        rate_xy2 = (final_pos[1] - target_pos[1]) / im_bounds[1]
-        max_change = max(abs((final_pos[2] - target_sz[0])),
-                         abs((final_pos[3] - target_sz[1])))
-        if max_change == abs((final_pos[2] - target_sz[0])):
-            rate_wd = (final_pos[2] - target_sz[0]) / im_bounds[0]
-        else:
-            rate_wd = (final_pos[3] - target_sz[1]) / im_bounds[1]
+        rate_xy1 = (final_pos[0] - target_pos[0]) / target_sz[0]
+        rate_xy2 = (final_pos[1] - target_pos[1]) / target_sz[1]
+        rate_wd  = final_pos[2] / target_sz[0]
+
+        # rate_xy1 = (final_pos[0] - target_pos[0]) / im_bounds[0]
+        # rate_xy2 = (final_pos[1] - target_pos[1]) / im_bounds[1]
+        # max_change = max(abs((final_pos[2] - target_sz[0])),
+        #                  abs((final_pos[3] - target_sz[1])))
+        # if max_change == abs((final_pos[2] - target_sz[0])):
+        #     rate_wd = (final_pos[2] - target_sz[0]) / im_bounds[0]
+        # else:
+        #     rate_wd = (final_pos[3] - target_sz[1]) / im_bounds[1]
 
     score_size_int = int(p.score_size)
     win_2d = np.outer(np.hanning(score_size_int), np.hanning(score_size_int))
@@ -520,7 +536,7 @@ def rtaa_sift_attack(net, x_init, x, gt, target_pos, target_sz, scale_z, p,
         else:
             L_kornia = torch.zeros((), device=x_adv.device)
 
-        loss = L_rtaa + alpha_dog * L_dog + gamma_kornia * L_kornia
+        loss = 0*L_rtaa + alpha_dog * L_dog + gamma_kornia * L_kornia
         print(f"Iter {i+1}/{iteration}: L_rtaa={L_rtaa.item():.4f}, "
               f"L_dog={L_dog.item():.4f}, L_kornia={L_kornia.item():.4f}, "
               f"L_total={loss.item():.4f}")
