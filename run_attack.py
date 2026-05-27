@@ -566,6 +566,196 @@ def rtaa_sift_attack(net, x_init, x, gt, target_pos, target_sz, scale_z, p,
     return x_adv
 
 
+def rtaa_sift_attack_frame(net,
+                           x_clean_frame, gt, target_pos, target_sz, scale_z, p,
+                           r_target_crop_bbox,
+                           eps=10, iteration=5,
+                           x_val_min=0, x_val_max=255,
+                           pscore_weight=50.0,
+                           pseudo_iou_thresh=0.1, truth_suppress_iou_thresh=0.1,
+                           final_pos=None, im_bounds=None,
+                           attack_mask_frame=None,
+                           alpha_dog=1000.0, gamma_kornia=0.0,
+                           dog_contrast=0.04, kornia_num_features=500,
+                           rtaa_weight=1.0,
+                           delta_init=None,
+                           loss_log=None,
+                           model_sz=271):
+    """RTAA + SIFT-evasion attack with the perturbation parameterised at
+    frame (search-region) resolution rather than the network's 271x271 input.
+
+    The tracker only ever sees the model_sz x model_sz downsample, but a SIFT
+    detector running on the rendered image works at native frame resolution.
+    Parameterising at 271 cannot construct structure above its Nyquist; this
+    function moves the optimisation to s_x_int x s_x_int and uses a
+    differentiable bilinear downsample for the tracker forward.
+
+    Inputs
+    ------
+    x_clean_frame : (1, 3, s_x_int, s_x_int) torch float, clean search crop
+                    at native frame resolution (skip cv2.resize in
+                    get_subwindow_tracking by passing model_sz == original_sz).
+    r_target_crop_bbox : [cx, cy, cw, ch] in the s_x_int crop's pixel coords
+                         -- where the SIFT defense would look. Use the helper
+                         frame_bbox_to_crop_bbox in the experiment script.
+    attack_mask_frame  : optional (1, 1, s_x_int, s_x_int) {0,1} mask in the
+                         same coords (e.g. segmentation kosher region).
+    rtaa_weight        : scalar weight on the L_RTAA term. Set to 0 to study
+                         L_dog alone.
+
+    Returns
+    -------
+    delta_frame : (1, 3, s_x_int, s_x_int) frame-res perturbation (detached)
+    x_adv_271   : (1, 3, model_sz, model_sz) post-attack tracker input
+                  (detached). Feed directly to the tracker forward.
+    """
+    from sift_attack import sift_dog_suppress_loss, sift_kornia_suppress_loss
+
+    x_clean_frame = Variable(x_clean_frame.data)
+    if delta_init is None:
+        delta = torch.zeros_like(x_clean_frame, requires_grad=True)
+    else:
+        delta = Variable(delta_init.data.clone(), requires_grad=True)
+    alpha = eps * 1.0 / iteration
+
+    if final_pos is None or im_bounds is None:
+        rate_xy1 = 0.3; rate_xy2 = 0.3; rate_wd = 1.0
+    else:
+        rate_xy1 = (final_pos[0] - target_pos[0]) / target_sz[0]
+        rate_xy2 = (final_pos[1] - target_pos[1]) / target_sz[1]
+        rate_wd  = final_pos[2] / target_sz[0]
+
+    score_size_int = int(p.score_size)
+    win_2d = np.outer(np.hanning(score_size_int), np.hanning(score_size_int))
+    window_np = np.tile(win_2d.flatten(), p.anchor_num).astype(np.float32)
+    window_t = torch.from_numpy(window_np).cuda()
+
+    tsz_scaled = np.asarray(target_sz, dtype=np.float32) * scale_z
+    tsz0 = torch.tensor(float(tsz_scaled[0])).cuda()
+    tsz1 = torch.tensor(float(tsz_scaled[1])).cuda()
+    anchor_w_t = torch.from_numpy(p.anchor[:, 2].astype(np.float32)).cuda()
+    anchor_h_t = torch.from_numpy(p.anchor[:, 3].astype(np.float32)).cuda()
+
+    def _change_t(r):
+        return torch.maximum(r, 1.0 / r)
+
+    def _sz_t(w, h):
+        pad = (w + h) * 0.5
+        return torch.sqrt((w + pad) * (h + pad))
+
+    target_sz_norm = _sz_t(tsz0, tsz1)
+    target_ratio = tsz0 / tsz1
+
+    for i in range(iteration):
+        x_adv_frame = torch.clamp(x_clean_frame + delta, x_val_min, x_val_max)
+        x_adv_271 = F.interpolate(x_adv_frame, size=(model_sz, model_sz),
+                                  mode='bilinear', align_corners=False)
+
+        d_out, score_out = net(x_adv_271)
+        score_temp = score_out.permute(1, 2, 3, 0).contiguous().view(2, -1)
+        score = torch.transpose(score_temp, 0, 1)
+        delta1 = d_out.permute(1, 2, 3, 0).contiguous().view(4, -1)
+        delta_np = d_out.permute(1, 2, 3, 0).contiguous().view(4, -1).data.cpu().numpy()
+
+        gt_cen = rect_2_cxy_wh(gt)
+        gt_cen = np.tile(gt_cen, (p.anchor.shape[0], 1))
+        gt_cen[:, 0] = ((gt_cen[:, 0] - target_pos[0]) * scale_z - p.anchor[:, 0]) / p.anchor[:, 2]
+        gt_cen[:, 1] = ((gt_cen[:, 1] - target_pos[1]) * scale_z - p.anchor[:, 1]) / p.anchor[:, 3]
+        gt_cen[:, 2] = np.log(gt_cen[:, 2] * scale_z) / p.anchor[:, 2]
+        gt_cen[:, 3] = np.log(gt_cen[:, 3] * scale_z) / p.anchor[:, 3]
+
+        gt_cen_pseudo = rect_2_cxy_wh(gt)
+        gt_cen_pseudo = np.tile(gt_cen_pseudo, (p.anchor.shape[0], 1))
+        gt_cen_pseudo[:, 0] = ((gt_cen_pseudo[:, 0] - target_pos[0] - rate_xy1 * gt_cen_pseudo[:, 2]) * scale_z - p.anchor[:, 0]) / p.anchor[:, 2]
+        gt_cen_pseudo[:, 1] = ((gt_cen_pseudo[:, 1] - target_pos[1] - rate_xy2 * gt_cen_pseudo[:, 3]) * scale_z - p.anchor[:, 1]) / p.anchor[:, 3]
+        gt_cen_pseudo[:, 2] = np.log(gt_cen_pseudo[:, 2] * rate_wd * scale_z) / p.anchor[:, 2]
+        gt_cen_pseudo[:, 3] = np.log(gt_cen_pseudo[:, 3] * rate_wd * scale_z) / p.anchor[:, 3]
+
+        delta_np[0, :] = (delta_np[0, :] * p.anchor[:, 2] + p.anchor[:, 0]) / scale_z + target_pos[0]
+        delta_np[1, :] = (delta_np[1, :] * p.anchor[:, 3] + p.anchor[:, 1]) / scale_z + target_pos[1]
+        delta_np[2, :] = (np.exp(delta_np[2, :]) * p.anchor[:, 2]) / scale_z
+        delta_np[3, :] = (np.exp(delta_np[3, :]) * p.anchor[:, 3]) / scale_z
+        location = np.array([delta_np[0] - delta_np[2] / 2, delta_np[1] - delta_np[3] / 2,
+                             delta_np[2], delta_np[3]])
+
+        label = overlap_ratio(location, gt)
+        pseudo_box = np.array([gt[0] + rate_xy1 * gt[2],
+                               gt[1] + rate_xy2 * gt[3],
+                               gt[2] * rate_wd,
+                               gt[3] * rate_wd], dtype=np.float32)
+        label_pseudo = overlap_ratio(location, pseudo_box)
+
+        iou_hi = 0.7; iou_low = 0.3
+        y_pos = torch.from_numpy(np.where(label > iou_hi, 1, 0)).cuda().long()
+        y_neg = torch.from_numpy(np.where(label < iou_low, 0, 1)).cuda().long()
+        pos_index = np.where(y_pos.cpu() == 1)
+        neg_index = np.where(y_neg.cpu() == 0)
+        index = np.concatenate((pos_index[0], neg_index[0]))
+        y_pos_pseudo = torch.from_numpy(np.where(label > iou_hi, 0, 1)).cuda().long()
+
+        loss_truth_cls  = -F.cross_entropy(score[index], y_pos[index])
+        loss_pseudo_cls = -F.cross_entropy(score[index], y_pos_pseudo[index])
+        loss_cls = (loss_truth_cls - loss_pseudo_cls) * 1
+
+        loss_truth_reg  = -rpn_smoothL1(delta1, gt_cen,        y_pos)
+        loss_pseudo_reg = -rpn_smoothL1(delta1, gt_cen_pseudo, y_pos)
+        loss_reg = (loss_truth_reg - loss_pseudo_reg) * 5
+
+        sm_score = F.softmax(score, dim=1)[:, 1]
+        w_pred = torch.exp(delta1[2, :]) * anchor_w_t
+        h_pred = torch.exp(delta1[3, :]) * anchor_h_t
+        s_c = _change_t(_sz_t(w_pred, h_pred) / target_sz_norm)
+        r_c = _change_t(target_ratio / (w_pred / h_pred))
+        penalty = torch.exp(-(r_c * s_c - 1.0) * p.penalty_k)
+        pscore_t = penalty * sm_score * (1.0 - p.window_influence) + window_t * p.window_influence
+
+        pseudo_mask = torch.from_numpy((label_pseudo > pseudo_iou_thresh).astype(np.float32)).cuda()
+        truth_mask  = torch.from_numpy((label > truth_suppress_iou_thresh).astype(np.float32)).cuda()
+        n_p = pseudo_mask.sum().clamp_min(1.0)
+        n_t = truth_mask.sum().clamp_min(1.0)
+        loss_pscore_pseudo = -(pscore_t * pseudo_mask).sum() / n_p
+        loss_pscore_truth  =  (pscore_t * truth_mask ).sum() / n_t
+        loss_pscore = (loss_pscore_pseudo + loss_pscore_truth) * pscore_weight
+
+        L_rtaa = loss_cls + loss_reg + loss_pscore
+
+        L_dog = sift_dog_suppress_loss(x_adv_frame, r_target_crop_bbox,
+                                       contrast=dog_contrast)
+        if gamma_kornia > 0:
+            L_kornia = sift_kornia_suppress_loss(
+                x_adv_frame, r_target_crop_bbox, num_features=kornia_num_features)
+        else:
+            L_kornia = torch.zeros((), device=x_adv_frame.device)
+
+        loss = rtaa_weight * L_rtaa + alpha_dog * L_dog + gamma_kornia * L_kornia
+
+        if loss_log is not None:
+            loss_log.setdefault('L_rtaa',   []).append(float(L_rtaa.detach()))
+            loss_log.setdefault('L_dog',    []).append(float(L_dog.detach()))
+            loss_log.setdefault('L_kornia', []).append(float(L_kornia.detach()))
+            loss_log.setdefault('L_total',  []).append(float(loss.detach()))
+
+        net.zero_grad()
+        if delta.grad is not None:
+            delta.grad.data.zero_()
+        loss.backward(retain_graph=True)
+
+        grad_sign = torch.sign(delta.grad)
+        delta = delta - alpha * grad_sign
+
+        delta = torch.clamp(delta, -eps, eps)
+        # Keep x_clean + delta in valid pixel range
+        delta = torch.clamp(x_clean_frame + delta, x_val_min, x_val_max) - x_clean_frame
+        if attack_mask_frame is not None:
+            delta = delta * attack_mask_frame
+        delta = Variable(delta.detach(), requires_grad=True)
+
+    x_adv_frame = torch.clamp(x_clean_frame + delta, x_val_min, x_val_max)
+    x_adv_271   = F.interpolate(x_adv_frame, size=(model_sz, model_sz),
+                                mode='bilinear', align_corners=False)
+    return delta.detach(), x_adv_271.detach()
+
+
 def tracker_eval(net, x_crop, target_pos, target_sz, window, scale_z, p, f, gt, state):
     delta, score = net(x_crop)
 

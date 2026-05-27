@@ -135,6 +135,7 @@ def sift_dog_suppress_loss(x_adv, r_target_crop_bbox,
     _, _, H, W = R.shape
     mask = make_crop_mask(H, W, r_target_crop_bbox, x_adv.device, soft_edge)
     excess = F.relu(R - contrast) * mask
+    excess = R * mask
     return excess.sum() / mask.sum().clamp(min=1.0)
 
 
