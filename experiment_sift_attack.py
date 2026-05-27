@@ -490,9 +490,30 @@ def simulate_attack(net, detector, image_files, gt, init_frame, sim_frames, args
                 round(s_x), state['avg_chans']
             ).unsqueeze(0)).cuda()
             delta_frame_t = None
-            loss_log['amerini_iters']    = [float(n_amerini)]
-            loss_log['amerini_kp_init']  = [float(kp_amer_init)]
-            loss_log['amerini_kp_final'] = [float(kp_amer_final)]
+            # Pixel-magnitude diagnostics, comparable to PGD's --eps:
+            #   amerini_linf  = max |Δ| across all pixels/channels (same units
+            #                   as the gradient attack's eps; the "implied eps"
+            #                   that smoothing happens to use)
+            #   amerini_l1_mean = mean |Δ| over pixels where any channel changed
+            #                   (typical per-edit magnitude inside the attacked
+            #                    regions; usually much smaller than linf)
+            #   amerini_n_perturbed_frac = fraction of frame pixels touched
+            diff_int = (im_attacked_pre.astype(np.int16)
+                        - im.astype(np.int16))
+            abs_diff = np.abs(diff_int)
+            touched_mask = abs_diff.sum(axis=-1) > 0     # H x W bool
+            n_touched    = int(touched_mask.sum())
+            mean_abs_in_touched = (
+                float(abs_diff[touched_mask].mean()) if n_touched > 0 else 0.0
+            )
+            loss_log['amerini_iters']            = [float(n_amerini)]
+            loss_log['amerini_kp_init']          = [float(kp_amer_init)]
+            loss_log['amerini_kp_final']         = [float(kp_amer_final)]
+            loss_log['amerini_linf']             = [float(abs_diff.max())]
+            loss_log['amerini_l1_mean']          = [float(mean_abs_in_touched)]
+            loss_log['amerini_n_perturbed_frac'] = [
+                float(n_touched) / float(touched_mask.size)
+            ]
 
         else:
             raise ValueError(f"unknown --attack {args.attack}")
@@ -677,7 +698,20 @@ def print_summary(benign_log, attack_log, args):
     if 'amerini_iters' in ll0:
         mean_iters = np.mean([e['loss_log']['amerini_iters'][0]
                               for e in attack_log])
+        mean_linf  = np.mean([e['loss_log']['amerini_linf'][0]
+                              for e in attack_log])
+        max_linf   = np.max ([e['loss_log']['amerini_linf'][0]
+                              for e in attack_log])
+        mean_l1    = np.mean([e['loss_log']['amerini_l1_mean'][0]
+                              for e in attack_log])
+        mean_cov   = np.mean([e['loss_log']['amerini_n_perturbed_frac'][0]
+                              for e in attack_log])
         print(f"  amerini outer iters used (mean): {mean_iters:.1f} / {args.amerini_max_iter}")
+        print(f"  amerini perturbation magnitude:")
+        print(f"    max |delta| per frame  : mean={mean_linf:.1f}  max={max_linf:.1f}  "
+              f"(== implied L_inf eps; compare to PGD --eps)")
+        print(f"    mean |delta| in touched pixels: {mean_l1:.2f}")
+        print(f"    fraction of frame pixels touched: {mean_cov * 100:.2f}%")
     if 'sparse_n_kps' in ll0:
         mean_n_kps = np.mean([e['loss_log']['sparse_n_kps'][0]     for e in attack_log])
         mean_area  = np.mean([e['loss_log']['sparse_area_frac'][0] for e in attack_log])
