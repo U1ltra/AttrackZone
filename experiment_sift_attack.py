@@ -210,6 +210,47 @@ def count_kps_in_roi(detector, frame, bbox):
     return len(detector.extract_features(frame, mask=mask)[0])
 
 
+def build_kp_sparse_mask(detector, frame, r_target_frame_bbox,
+                         target_pos, s_x_int, half_side=4):
+    """Build a {0,1} spatial-sparsity mask for the gradient attack.
+
+    Detects SIFT keypoints inside `r_target_frame_bbox` in the *clean* frame
+    once, then turns on a (2*half_side)x(2*half_side) square around each kp
+    (in s_x_int crop-relative coords). Pass this to `rtaa_sift_attack_frame`
+    via `attack_mask_frame=` to force the gradient PGD to spend its budget
+    only on the spatial support where keypoints actually exist -- the
+    spatial-sparsity prior that Amerini's smoothing attack uses implicitly.
+
+    Returns
+    -------
+    mask_t       : (1, 1, s_x_int, s_x_int) float cuda tensor (broadcasts
+                   across the 3 colour channels of delta in the PGD loop)
+    n_kps        : how many kps the mask is built around
+    area_frac    : fraction of crop pixels with mask=1 (for logging)
+    """
+    full = _bbox_to_image_mask(frame.shape, r_target_frame_bbox)
+    if full.sum() == 0:
+        kps = []
+    else:
+        kps, _ = detector.extract_features(frame, mask=full)
+
+    c = (s_x_int + 1) / 2
+    sx_left = round(target_pos[0] - c)
+    sy_top  = round(target_pos[1] - c)
+
+    m = np.zeros((s_x_int, s_x_int), dtype=np.float32)
+    for kp in kps:
+        cx = int(round(kp.pt[0] - sx_left))
+        cy = int(round(kp.pt[1] - sy_top))
+        x0 = max(cx - half_side, 0); y0 = max(cy - half_side, 0)
+        x1 = min(cx + half_side, s_x_int); y1 = min(cy + half_side, s_x_int)
+        if x1 > x0 and y1 > y0:
+            m[y0:y1, x0:x1] = 1.0
+
+    mask_t = torch.from_numpy(m).unsqueeze(0).unsqueeze(0).cuda()
+    return mask_t, len(kps), float(m.sum() / m.size)
+
+
 # ---------------------------------------------------------------------------
 # Amerini-style iterative keypoint-targeted smoothing attack.
 # ---------------------------------------------------------------------------
@@ -409,12 +450,21 @@ def simulate_attack(net, detector, image_files, gt, init_frame, sim_frames, args
             r_target_crop = frame_bbox_to_crop_bbox_frame_res(
                 r_target_frame, target_pos, s_x_int
             )
+            sparse_mask_t = None
+            if args.sparse_mask:
+                sparse_mask_t, n_kp_for_mask, area_frac = build_kp_sparse_mask(
+                    detector, im, r_target_frame, target_pos, s_x_int,
+                    half_side=args.sparse_half_side,
+                )
+                loss_log['sparse_n_kps']     = [float(n_kp_for_mask)]
+                loss_log['sparse_area_frac'] = [float(area_frac)]
             delta_frame_t, x_for_tracker = rtaa_sift_attack_frame(
                 net, x_frame_clean, prev_pred_bbox,
                 target_pos, target_sz, scale_z, p,
                 r_target_crop_bbox=r_target_crop,
                 eps=args.eps, iteration=args.n_iter,
                 final_pos=final_pos, im_bounds=im_bounds,
+                attack_mask_frame=sparse_mask_t,
                 alpha_dog=args.alpha_dog, gamma_kornia=args.gamma_kornia,
                 dog_contrast=args.dog_contrast,
                 rtaa_weight=args.rtaa_weight,
@@ -628,6 +678,11 @@ def print_summary(benign_log, attack_log, args):
         mean_iters = np.mean([e['loss_log']['amerini_iters'][0]
                               for e in attack_log])
         print(f"  amerini outer iters used (mean): {mean_iters:.1f} / {args.amerini_max_iter}")
+    if 'sparse_n_kps' in ll0:
+        mean_n_kps = np.mean([e['loss_log']['sparse_n_kps'][0]     for e in attack_log])
+        mean_area  = np.mean([e['loss_log']['sparse_area_frac'][0] for e in attack_log])
+        print(f"  sparse mask: {mean_n_kps:.1f} kps (mean), "
+              f"{mean_area * 100:.1f}% of crop area perturbable")
 
 
 # ---------------------------------------------------------------------------
@@ -662,6 +717,16 @@ def main():
                         choices=['gt', 'prev_pred'],
                         help='Where R_target (SIFT suppress region) comes from. '
                              'gt = oracle attacker; prev_pred = causal attacker.')
+    parser.add_argument('--sparse_mask', action='store_true',
+                        help='Constrain the rtaa_sift_frame perturbation to '
+                             '(2*sparse_half_side)x(2*sparse_half_side) squares '
+                             'around each SIFT kp detected in R_target on the '
+                             'clean frame -- Amerini-style spatial sparsity '
+                             'applied to the gradient attack. Only honoured by '
+                             '--attack rtaa_sift_frame.')
+    parser.add_argument('--sparse_half_side', type=int, default=4,
+                        help='Half-side of the per-kp square in pixels '
+                             '(default 4 matches Amerini 8x8 patches).')
     # --- Amerini smoothing-attack knobs (only honoured by amerini_smoothing) ---
     parser.add_argument('--amerini_sigma',          type=float, default=0.7,
                         help='Gaussian std for the per-kp smoothing (paper: 0.7)')
