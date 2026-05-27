@@ -640,6 +640,15 @@ def save_log(out_path, benign_log, attack_log, args):
             arr[i, :len(vals)] = vals
         return arr
 
+    def _stack_scalar(key):
+        """Per-frame scalar (loss_log[key] is a 1-element list)."""
+        arr = np.full((NF,), np.nan, dtype=np.float32)
+        for i, e in enumerate(attack_log):
+            vals = e['loss_log'].get(key, []) if e['loss_log'] else []
+            if vals:
+                arr[i] = float(vals[0])
+        return arr
+
     np.savez(
         out_path,
         attack_variant   = np.array(args.attack),
@@ -673,6 +682,18 @@ def save_log(out_path, benign_log, attack_log, args):
         loss_dog    = _stack('L_dog'),
         loss_kornia = _stack('L_kornia'),
         loss_total  = _stack('L_total'),
+
+        # Per-frame Amerini diagnostics (NaN for non-amerini variants)
+        amerini_iters            = _stack_scalar('amerini_iters'),
+        amerini_kp_init          = _stack_scalar('amerini_kp_init'),
+        amerini_kp_final         = _stack_scalar('amerini_kp_final'),
+        amerini_linf             = _stack_scalar('amerini_linf'),
+        amerini_l1_mean          = _stack_scalar('amerini_l1_mean'),
+        amerini_n_perturbed_frac = _stack_scalar('amerini_n_perturbed_frac'),
+
+        # Per-frame sparse-mask diagnostics (NaN unless --sparse_mask)
+        sparse_n_kps             = _stack_scalar('sparse_n_kps'),
+        sparse_area_frac         = _stack_scalar('sparse_area_frac'),
     )
 
 
