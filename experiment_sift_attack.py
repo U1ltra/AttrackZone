@@ -211,6 +211,87 @@ def count_kps_in_roi(detector, frame, bbox):
 
 
 # ---------------------------------------------------------------------------
+# Amerini-style iterative keypoint-targeted smoothing attack.
+# ---------------------------------------------------------------------------
+# Faithful baseline for the "vanilla keypoint attack" from
+#   Amerini et al., "Counter-forensics of SIFT-based copy-move detection by
+#   means of keypoint classification", EURASIP J. Image Video Process. 2013.
+# This is the single weakest of their three attacks (smoothing-only, class-
+# unaware) but the conceptually cleanest: no patch database, no per-kp
+# optimization. Acts as a CEILING reference for "how many kps can be removed
+# in R_target if we drop the L_inf budget and only optimize for kp removal."
+#
+# Differences vs the gradient SIFT attack (rtaa_sift_frame, rtaa_weight=0):
+#   - per-keypoint (8x8 patch around each kp), not per-ROI uniform
+#   - iterative: re-detect kps each iter so the attack handles its own
+#     "smoothing creates new kps" failure mode (paper sec 4.3)
+#   - no L_inf budget — only image-quality preservation (small kernel)
+#   - no tracker hijack — pure SIFT suppression; the tracker forward on the
+#     attacked frame is purely diagnostic
+# ---------------------------------------------------------------------------
+
+def amerini_smoothing_attack(frame_bgr, roi_bbox, detector,
+                             sigma=0.7, gaussian_ksize=3,
+                             patch_half=4, max_iter=40,
+                             target_removal=1.0):
+    """One-shot Amerini-style smoothing attack on the kps inside `roi_bbox`.
+
+    Pseudocode (mirrors Algorithm 1 of the paper, single-attack variant):
+        attacked = frame
+        kps_init = SIFT(attacked) inside roi_bbox
+        while iter < max_iter and removal_rate < target_removal:
+            kps      = SIFT(attacked) inside roi_bbox
+            blurred  = GaussianBlur(attacked, ksize, sigma)
+            for kp in kps:
+                paste blurred[patch around kp.xy] back into attacked
+            iter += 1
+        return attacked, ...
+
+    Returns
+    -------
+    attacked     : uint8 HxWx3 BGR — modified frame
+    n_iters_done : how many outer iterations were actually run
+    kp_final     : kps inside roi_bbox at the end
+    kp_init      : kps inside roi_bbox at the start (for removal_rate)
+    """
+    if gaussian_ksize % 2 == 0:
+        gaussian_ksize += 1
+    H, W = frame_bgr.shape[:2]
+
+    def _kps_in_roi(frame):
+        mask = _bbox_to_image_mask(frame.shape, roi_bbox)
+        if mask.sum() == 0:
+            return []
+        kps, _ = detector.extract_features(frame, mask=mask)
+        return kps
+
+    kps_init = _kps_in_roi(frame_bgr)
+    n_init   = max(len(kps_init), 1)
+    kp_stop  = int(n_init * (1.0 - target_removal))
+
+    attacked = frame_bgr.copy()
+    n_iters  = 0
+    for it in range(max_iter):
+        kps = _kps_in_roi(attacked)
+        if len(kps) <= kp_stop:
+            break
+        blurred = cv2.GaussianBlur(attacked, (gaussian_ksize, gaussian_ksize),
+                                   sigma)
+        for kp in kps:
+            x, y = int(round(kp.pt[0])), int(round(kp.pt[1]))
+            x0 = max(x - patch_half, 0)
+            y0 = max(y - patch_half, 0)
+            x1 = min(x + patch_half, W)
+            y1 = min(y + patch_half, H)
+            if x1 > x0 and y1 > y0:
+                attacked[y0:y1, x0:x1] = blurred[y0:y1, x0:x1]
+        n_iters = it + 1
+
+    final_kps = _kps_in_roi(attacked)
+    return attacked, n_iters, len(final_kps), len(kps_init)
+
+
+# ---------------------------------------------------------------------------
 # Dataset loading.
 # ---------------------------------------------------------------------------
 
@@ -339,12 +420,38 @@ def simulate_attack(net, detector, image_files, gt, init_frame, sim_frames, args
                 rtaa_weight=args.rtaa_weight,
                 loss_log=loss_log,
             )
+
+        elif args.attack == 'amerini_smoothing':
+            # Modify the frame directly via iterative per-kp smoothing, then
+            # re-extract the tracker's 271 crop from the modified frame so
+            # the forward pass sees what SIFT also sees.
+            im_attacked_pre, n_amerini, kp_amer_final, kp_amer_init = (
+                amerini_smoothing_attack(
+                    im, r_target_frame, detector,
+                    sigma=args.amerini_sigma,
+                    gaussian_ksize=args.amerini_ksize,
+                    patch_half=args.amerini_patch_half,
+                    max_iter=args.amerini_max_iter,
+                    target_removal=args.amerini_target_removal,
+                )
+            )
+            x_for_tracker = Variable(get_subwindow_tracking(
+                im_attacked_pre, target_pos, p.instance_size,
+                round(s_x), state['avg_chans']
+            ).unsqueeze(0)).cuda()
+            delta_frame_t = None
+            loss_log['amerini_iters']    = [float(n_amerini)]
+            loss_log['amerini_kp_init']  = [float(kp_amer_init)]
+            loss_log['amerini_kp_final'] = [float(kp_amer_final)]
+
         else:
             raise ValueError(f"unknown --attack {args.attack}")
 
         # Render the attacked frame
         if args.attack == 'none':
             im_attacked = im.copy()
+        elif args.attack == 'amerini_smoothing':
+            im_attacked = im_attacked_pre
         elif args.attack == 'rtaa_sift_frame':
             im_attacked = inject_frame_res(im, delta_frame_t, target_pos, s_x_int)
         else:
@@ -511,13 +618,16 @@ def print_summary(benign_log, attack_log, args):
     print(f"  removal_rate (R_target): {rr:.3f}     "
           f"(higher => SIFT signal suppressed)")
     print(f"  removal_rate (GT box)  : {rr_gt:.3f}")
-    if attack_log and attack_log[0]['loss_log']:
-        rtaa0 = attack_log[0]['loss_log']['L_rtaa'][0]
-        rtaa1 = attack_log[0]['loss_log']['L_rtaa'][-1]
-        dog0  = attack_log[0]['loss_log']['L_dog'][0]
-        dog1  = attack_log[0]['loss_log']['L_dog'][-1]
+    ll0 = attack_log[0]['loss_log'] if attack_log else {}
+    if 'L_rtaa' in ll0 and ll0['L_rtaa']:
+        rtaa0, rtaa1 = ll0['L_rtaa'][0],  ll0['L_rtaa'][-1]
+        dog0,  dog1  = ll0['L_dog'][0],   ll0['L_dog'][-1]
         print(f"  frame 0 L_rtaa: {rtaa0:+.3f} -> {rtaa1:+.3f}   "
               f"L_dog: {dog0:.4f} -> {dog1:.4f}")
+    if 'amerini_iters' in ll0:
+        mean_iters = np.mean([e['loss_log']['amerini_iters'][0]
+                              for e in attack_log])
+        print(f"  amerini outer iters used (mean): {mean_iters:.1f} / {args.amerini_max_iter}")
 
 
 # ---------------------------------------------------------------------------
@@ -538,7 +648,7 @@ def main():
 
     parser.add_argument('--attack', default='rtaa_sift_frame',
                         choices=['none', 'rtaa', 'rtaa_sift_crop',
-                                 'rtaa_sift_frame'])
+                                 'rtaa_sift_frame', 'amerini_smoothing'])
     parser.add_argument('--eps',          type=float, default=16.0,
                         help='L_inf perturbation budget in pixel units')
     parser.add_argument('--n_iter',       type=int,   default=10)
@@ -552,6 +662,19 @@ def main():
                         choices=['gt', 'prev_pred'],
                         help='Where R_target (SIFT suppress region) comes from. '
                              'gt = oracle attacker; prev_pred = causal attacker.')
+    # --- Amerini smoothing-attack knobs (only honoured by amerini_smoothing) ---
+    parser.add_argument('--amerini_sigma',          type=float, default=0.7,
+                        help='Gaussian std for the per-kp smoothing (paper: 0.7)')
+    parser.add_argument('--amerini_ksize',          type=int,   default=3,
+                        help='Gaussian kernel size (paper: 3)')
+    parser.add_argument('--amerini_patch_half',     type=int,   default=4,
+                        help='Half-side of the per-kp modification patch '
+                             '(paper: 4, giving 8x8 patches)')
+    parser.add_argument('--amerini_max_iter',       type=int,   default=40,
+                        help='Outer iter cap (paper: 40)')
+    parser.add_argument('--amerini_target_removal', type=float, default=1.0,
+                        help='Early-stop once removal_rate >= this. '
+                             '1.0 = run until no kps left (or hit max_iter).')
     parser.add_argument('--no_video', action='store_true')
     args = parser.parse_args()
 
