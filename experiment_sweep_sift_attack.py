@@ -92,7 +92,7 @@ def compute_metrics(log_path):
         'roi_source':        str(d['roi_source']),
         'benign_iou':        benign_iou,
         'attack_iou':        attack_iou,
-        'iou_drop':          benign_iou - attack_iou,
+        'iou_drop':          attack_iou - benign_iou,
         'removal_rate':      rr,
         'removal_rate_gt':   rr_gt,
         'kp_clean':          kp_clean,
@@ -110,14 +110,19 @@ def compute_metrics(log_path):
     def _max(key):
         return float(np.nanmax(d[key])) if key in d.files else float('nan')
 
-    out['amerini_iters']            = _mean('amerini_iters')
-    out['amerini_linf_mean']        = _mean('amerini_linf')
-    out['amerini_linf_max']         = _max('amerini_linf')
-    out['amerini_l1_mean']          = _mean('amerini_l1_mean')
-    out['amerini_n_perturbed_frac'] = _mean('amerini_n_perturbed_frac')
+    # Per-frame pixel-magnitude diagnostics: generic, populated for every
+    # attack variant except 'none'. Lets gradient and amerini attacks be
+    # compared on the same axis as --eps.
+    out['perturbation_linf_mean'] = _mean('perturbation_linf')
+    out['perturbation_linf_max']  = _max ('perturbation_linf')
+    out['perturbation_l1_mean']   = _mean('perturbation_l1_mean')
+    out['perturbation_frac']      = _mean('perturbation_frac')
 
-    out['sparse_n_kps']             = _mean('sparse_n_kps')
-    out['sparse_area_frac']         = _mean('sparse_area_frac')
+    # Amerini-only iteration count
+    out['amerini_iters']          = _mean('amerini_iters')
+
+    out['sparse_n_kps']           = _mean('sparse_n_kps')
+    out['sparse_area_frac']       = _mean('sparse_area_frac')
     return out
 
 
@@ -203,20 +208,21 @@ def list_videos(dataset_name, data_dir):
 # Summary printers
 # ---------------------------------------------------------------------------
 
-def _print_amerini_block(results, indent='    '):
-    """Print amerini per-frame magnitude diagnostics (when non-NaN)."""
+def _print_perturbation_block(results, indent='    '):
+    """Print per-frame magnitude diagnostics (any attack variant)."""
     def _mean(k): return np.nanmean([r[k] for r in results])
     def _max (k): return np.nanmax ([r[k] for r in results])
-    if not np.isfinite(_mean('amerini_linf_mean')):
+    if not np.isfinite(_mean('perturbation_linf_mean')):
         return
-    print(f"{indent}amerini perturbation magnitude (== implied L_inf eps):")
+    print(f"{indent}perturbation magnitude (== implied L_inf eps):")
     print(f"{indent}  max |delta| per frame:   "
-          f"mean={_mean('amerini_linf_mean'):.1f}   "
-          f"worst-frame max={_max('amerini_linf_max'):.1f}")
-    print(f"{indent}  mean |delta| in touched: {_mean('amerini_l1_mean'):.2f}")
+          f"mean={_mean('perturbation_linf_mean'):.1f}   "
+          f"worst-frame max={_max('perturbation_linf_max'):.1f}")
+    print(f"{indent}  mean |delta| in touched: {_mean('perturbation_l1_mean'):.2f}")
     print(f"{indent}  fraction frame touched:  "
-          f"{_mean('amerini_n_perturbed_frac') * 100:.2f}%")
-    print(f"{indent}  amerini outer iters/frame: {_mean('amerini_iters'):.1f}")
+          f"{_mean('perturbation_frac') * 100:.2f}%")
+    if np.isfinite(_mean('amerini_iters')):
+        print(f"{indent}  amerini outer iters/frame: {_mean('amerini_iters'):.1f}")
 
 
 def _print_sparse_block(results, indent='    '):
@@ -239,8 +245,8 @@ def _print_video_summary(video, results):
     print(f"    removal_rate    = {_m('removal_rate'):.3f} ± {_s('removal_rate'):.3f}   "
           f"(GT-box: {_m('removal_rate_gt'):.3f})")
     print(f"    kp_clean → atk  = {_m('kp_clean'):.1f} → {_m('kp_attacked'):.1f}")
-    _print_amerini_block(results, indent='    ')
-    _print_sparse_block (results, indent='    ')
+    _print_perturbation_block(results, indent='    ')
+    _print_sparse_block      (results, indent='    ')
 
 
 def _print_aggregate(results, attack_label):
@@ -264,8 +270,8 @@ def _print_aggregate(results, attack_label):
         print(f"  L_dog (final iter, mean over frames/runs): {_m('L_dog_final'):.4g}")
     if np.isfinite(_m('L_rtaa_final')):
         print(f"  L_rtaa (final iter, mean over frames/runs): {_m('L_rtaa_final'):+.3f}")
-    _print_amerini_block(results, indent='  ')
-    _print_sparse_block (results, indent='  ')
+    _print_perturbation_block(results, indent='  ')
+    _print_sparse_block      (results, indent='  ')
 
 
 def _save_results(results, out_dir, tag):
@@ -274,9 +280,9 @@ def _save_results(results, out_dir, tag):
               'benign_iou', 'attack_iou', 'iou_drop',
               'removal_rate', 'removal_rate_gt',
               'kp_clean', 'kp_attacked', 'L_dog_final', 'L_rtaa_final',
-              'amerini_iters', 'amerini_linf_mean', 'amerini_linf_max',
-              'amerini_l1_mean', 'amerini_n_perturbed_frac',
-              'sparse_n_kps', 'sparse_area_frac']
+              'perturbation_linf_mean', 'perturbation_linf_max',
+              'perturbation_l1_mean', 'perturbation_frac',
+              'amerini_iters', 'sparse_n_kps', 'sparse_area_frac']
     with open(csv_path, 'w', newline='') as f:
         w = csv.DictWriter(f, fieldnames=fields, extrasaction='ignore')
         w.writeheader()
@@ -296,15 +302,15 @@ def _save_results(results, out_dir, tag):
         removal_rate_gt         = np.array([r['removal_rate_gt'] for r in results]),
         kp_clean                = np.array([r['kp_clean']        for r in results]),
         kp_attacked             = np.array([r['kp_attacked']     for r in results]),
-        L_dog_final             = np.array([r['L_dog_final']     for r in results]),
-        L_rtaa_final            = np.array([r['L_rtaa_final']    for r in results]),
-        amerini_iters           = np.array([r['amerini_iters']            for r in results]),
-        amerini_linf_mean       = np.array([r['amerini_linf_mean']        for r in results]),
-        amerini_linf_max        = np.array([r['amerini_linf_max']         for r in results]),
-        amerini_l1_mean         = np.array([r['amerini_l1_mean']          for r in results]),
-        amerini_n_perturbed_frac= np.array([r['amerini_n_perturbed_frac'] for r in results]),
-        sparse_n_kps            = np.array([r['sparse_n_kps']             for r in results]),
-        sparse_area_frac        = np.array([r['sparse_area_frac']         for r in results]),
+        L_dog_final             = np.array([r['L_dog_final']            for r in results]),
+        L_rtaa_final            = np.array([r['L_rtaa_final']           for r in results]),
+        perturbation_linf_mean  = np.array([r['perturbation_linf_mean'] for r in results]),
+        perturbation_linf_max   = np.array([r['perturbation_linf_max']  for r in results]),
+        perturbation_l1_mean    = np.array([r['perturbation_l1_mean']   for r in results]),
+        perturbation_frac       = np.array([r['perturbation_frac']      for r in results]),
+        amerini_iters           = np.array([r['amerini_iters']          for r in results]),
+        sparse_n_kps            = np.array([r['sparse_n_kps']           for r in results]),
+        sparse_area_frac        = np.array([r['sparse_area_frac']       for r in results]),
     )
     print(f"NPZ  -> {npz_path}")
 
