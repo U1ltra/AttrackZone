@@ -566,6 +566,43 @@ def rtaa_sift_attack(net, x_init, x, gt, target_pos, target_sz, scale_z, p,
     return x_adv
 
 
+def _rebuild_sparse_mask_in_crop(detector, x_adv_frame_t, r_target_crop_bbox,
+                                  half_side):
+    """SIFT-detect inside r_target_crop_bbox of the (perturbed) frame-res crop,
+    build a {0,1} window mask (1,1,H,W) covering 2*half_side squares around
+    each detected kp. Coordinates are crop-relative (same frame as the mask
+    that constrains delta in rtaa_sift_attack_frame).
+
+    Detector must be `sift_alignment.SIFTAlignmentDetector` (or compatible —
+    needs `.extract_features(frame_bgr_uint8, mask=uint8_mask)`).
+    """
+    x = x_adv_frame_t.detach().squeeze(0).cpu().numpy()      # (3, H, W) float
+    x = np.transpose(x, (1, 2, 0))                            # (H, W, 3) BGR
+    x = np.clip(x, 0, 255).astype(np.uint8)
+    h, w = x.shape[:2]
+
+    cx, cy, cw, ch = (int(round(v)) for v in r_target_crop_bbox)
+    det_mask = np.zeros((h, w), dtype=np.uint8)
+    x0, y0 = max(0, cx),               max(0, cy)
+    x1, y1 = max(0, min(w, cx + cw)),  max(0, min(h, cy + ch))
+    if x1 <= x0 or y1 <= y0:
+        return (torch.zeros(1, 1, h, w, device=x_adv_frame_t.device), 0)
+    det_mask[y0:y1, x0:x1] = 255
+
+    kps, _ = detector.extract_features(x, mask=det_mask)
+
+    m = np.zeros((h, w), dtype=np.float32)
+    for kp in kps:
+        kx, ky = int(round(kp.pt[0])), int(round(kp.pt[1]))
+        ax0 = max(kx - half_side, 0);  ay0 = max(ky - half_side, 0)
+        ax1 = min(kx + half_side, w);  ay1 = min(ky + half_side, h)
+        if ax1 > ax0 and ay1 > ay0:
+            m[ay0:ay1, ax0:ax1] = 1.0
+
+    mask_t = torch.from_numpy(m).unsqueeze(0).unsqueeze(0).to(x_adv_frame_t.device)
+    return mask_t, len(kps)
+
+
 def rtaa_sift_attack_frame(net,
                            x_clean_frame, gt, target_pos, target_sz, scale_z, p,
                            r_target_crop_bbox,
@@ -575,6 +612,15 @@ def rtaa_sift_attack_frame(net,
                            pseudo_iou_thresh=0.1, truth_suppress_iou_thresh=0.1,
                            final_pos=None, im_bounds=None,
                            attack_mask_frame=None,
+                           # --- Periodic sparse-mask refresh (re-detect kps in
+                           # the *currently perturbed* crop, union-extend the
+                           # mask so new/displaced kps become attackable.
+                           # Active only when ALL of: refresh_detector given,
+                           # attack_mask_frame given, refresh_every > 0). ---
+                           refresh_detector=None,
+                           refresh_every=0,
+                           refresh_cap=5,
+                           refresh_half_side=4,
                            alpha_dog=1000.0, gamma_kornia=0.0,
                            dog_contrast=0.04, kornia_num_features=500,
                            rtaa_weight=1.0,
@@ -646,8 +692,28 @@ def rtaa_sift_attack_frame(net,
     target_sz_norm = _sz_t(tsz0, tsz1)
     target_ratio = tsz0 / tsz1
 
+    refresh_active = (refresh_detector is not None
+                      and attack_mask_frame is not None
+                      and refresh_every > 0)
+    n_refreshes = 0
+
     for i in range(iteration):
         x_adv_frame = torch.clamp(x_clean_frame + delta, x_val_min, x_val_max)
+
+        # --- Periodic mask refresh: detect kps in the currently-perturbed
+        # crop, union-extend the sparse mask with windows around them. Skip
+        # at i==0 (the caller already gave us the initial mask). Union
+        # semantics guarantee the feasible set monotonically grows, so the
+        # loss can only stay the same or decrease across refreshes.
+        if (refresh_active and i > 0 and i % refresh_every == 0
+                and n_refreshes < refresh_cap):
+            new_mask, _n_kp_new = _rebuild_sparse_mask_in_crop(
+                refresh_detector, x_adv_frame, r_target_crop_bbox,
+                half_side=refresh_half_side,
+            )
+            attack_mask_frame = torch.maximum(attack_mask_frame, new_mask)
+            n_refreshes += 1
+
         x_adv_271 = F.interpolate(x_adv_frame, size=(model_sz, model_sz),
                                   mode='bilinear', align_corners=False)
 
@@ -753,6 +819,12 @@ def rtaa_sift_attack_frame(net,
     x_adv_frame = torch.clamp(x_clean_frame + delta, x_val_min, x_val_max)
     x_adv_271   = F.interpolate(x_adv_frame, size=(model_sz, model_sz),
                                 mode='bilinear', align_corners=False)
+
+    if loss_log is not None and refresh_active:
+        loss_log.setdefault('sparse_n_refreshes', []).append(float(n_refreshes))
+        final_frac = (attack_mask_frame > 0).float().mean().item()
+        loss_log.setdefault('sparse_area_frac_final', []).append(float(final_frac))
+
     return delta.detach(), x_adv_271.detach()
 
 

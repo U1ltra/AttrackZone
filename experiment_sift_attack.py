@@ -465,6 +465,12 @@ def simulate_attack(net, detector, image_files, gt, init_frame, sim_frames, args
                 eps=args.eps, iteration=args.n_iter,
                 final_pos=final_pos, im_bounds=im_bounds,
                 attack_mask_frame=sparse_mask_t,
+                refresh_detector=(detector if args.sparse_mask
+                                  and args.sparse_refresh_every > 0
+                                  else None),
+                refresh_every=args.sparse_refresh_every,
+                refresh_cap=args.sparse_refresh_cap,
+                refresh_half_side=args.sparse_half_side,
                 alpha_dog=args.alpha_dog, gamma_kornia=args.gamma_kornia,
                 dog_contrast=args.dog_contrast,
                 rtaa_weight=args.rtaa_weight,
@@ -706,8 +712,10 @@ def save_log(out_path, benign_log, attack_log, args):
         amerini_kp_final = _stack_scalar('amerini_kp_final'),
 
         # Per-frame sparse-mask diagnostics (NaN unless --sparse_mask)
-        sparse_n_kps     = _stack_scalar('sparse_n_kps'),
-        sparse_area_frac = _stack_scalar('sparse_area_frac'),
+        sparse_n_kps             = _stack_scalar('sparse_n_kps'),
+        sparse_area_frac         = _stack_scalar('sparse_area_frac'),
+        sparse_n_refreshes       = _stack_scalar('sparse_n_refreshes'),
+        sparse_area_frac_final   = _stack_scalar('sparse_area_frac_final'),
     )
 
 
@@ -751,8 +759,16 @@ def print_summary(benign_log, attack_log, args):
     if 'sparse_n_kps' in ll0:
         mean_n_kps = np.mean([e['loss_log']['sparse_n_kps'][0]     for e in attack_log])
         mean_area  = np.mean([e['loss_log']['sparse_area_frac'][0] for e in attack_log])
-        print(f"  sparse mask: {mean_n_kps:.1f} kps (mean), "
-              f"{mean_area * 100:.1f}% of crop area perturbable")
+        print(f"  sparse mask: {mean_n_kps:.1f} kps (init, mean), "
+              f"{mean_area * 100:.1f}% of crop area perturbable initially")
+        if 'sparse_n_refreshes' in ll0:
+            mean_ref  = np.mean([e['loss_log']['sparse_n_refreshes'][0]
+                                 for e in attack_log])
+            mean_area_f = np.mean([e['loss_log']['sparse_area_frac_final'][0]
+                                   for e in attack_log])
+            print(f"               {mean_ref:.1f} refreshes/frame, "
+                  f"{mean_area_f * 100:.1f}% perturbable after refresh "
+                  f"(grew by {mean_area_f / max(mean_area, 1e-9):.2f}x)")
 
 
 # ---------------------------------------------------------------------------
@@ -797,6 +813,18 @@ def main():
     parser.add_argument('--sparse_half_side', type=int, default=4,
                         help='Half-side of the per-kp square in pixels '
                              '(default 4 matches Amerini 8x8 patches).')
+    parser.add_argument('--sparse_refresh_every', type=int, default=0,
+                        help='When > 0, re-detect kps inside R_target on the '
+                             'currently-perturbed crop every K PGD iters and '
+                             'union-extend the sparse mask with windows around '
+                             'them. Targets the "attack creates new kps the '
+                             'initial mask cannot cover" failure mode -- '
+                             'mirrors Amerini Algorithm 1\'s outer loop. '
+                             'Only honoured with --sparse_mask.')
+    parser.add_argument('--sparse_refresh_cap', type=int, default=5,
+                        help='Max number of mask refreshes per attack call '
+                             '(prevents the union mask from saturating to '
+                             'the full R_target after many iters).')
     # --- Amerini smoothing-attack knobs (only honoured by amerini_smoothing) ---
     parser.add_argument('--amerini_sigma',          type=float, default=0.7,
                         help='Gaussian std for the per-kp smoothing (paper: 0.7)')

@@ -121,8 +121,10 @@ def compute_metrics(log_path):
     # Amerini-only iteration count
     out['amerini_iters']          = _mean('amerini_iters')
 
-    out['sparse_n_kps']           = _mean('sparse_n_kps')
-    out['sparse_area_frac']       = _mean('sparse_area_frac')
+    out['sparse_n_kps']             = _mean('sparse_n_kps')
+    out['sparse_area_frac']         = _mean('sparse_area_frac')
+    out['sparse_n_refreshes']       = _mean('sparse_n_refreshes')
+    out['sparse_area_frac_final']   = _mean('sparse_area_frac_final')
     return out
 
 
@@ -140,6 +142,8 @@ def _variant_tag(args):
         parts.append(f'rw{args.rtaa_weight:g}')
     if args.attack == 'rtaa_sift_frame' and args.sparse_mask:
         parts.append(f'sm{args.sparse_half_side}')
+        if args.sparse_refresh_every > 0:
+            parts.append(f'rf{args.sparse_refresh_every}c{args.sparse_refresh_cap}')
     if args.attack == 'amerini_smoothing':
         parts.append(f'as{args.amerini_sigma:g}')
         parts.append(f'ah{args.amerini_patch_half}')
@@ -177,7 +181,9 @@ def run_experiment(video, seed, args):
     ]
     if args.attack == 'rtaa_sift_frame' and args.sparse_mask:
         cmd += ['--sparse_mask',
-                '--sparse_half_side', str(args.sparse_half_side)]
+                '--sparse_half_side',     str(args.sparse_half_side),
+                '--sparse_refresh_every', str(args.sparse_refresh_every),
+                '--sparse_refresh_cap',   str(args.sparse_refresh_cap)]
     if args.attack == 'amerini_smoothing':
         cmd += [
             '--amerini_sigma',          str(args.amerini_sigma),
@@ -231,7 +237,13 @@ def _print_sparse_block(results, indent='    '):
     if not np.isfinite(_mean('sparse_n_kps')):
         return
     print(f"{indent}sparse mask: kps/frame={_mean('sparse_n_kps'):.1f}   "
-          f"crop area perturbable={_mean('sparse_area_frac') * 100:.1f}%")
+          f"crop area perturbable={_mean('sparse_area_frac') * 100:.1f}% (init)")
+    if np.isfinite(_mean('sparse_n_refreshes')):
+        init_area  = _mean('sparse_area_frac')
+        final_area = _mean('sparse_area_frac_final')
+        print(f"{indent}             refreshes/frame={_mean('sparse_n_refreshes'):.1f}   "
+              f"perturbable after refresh={final_area * 100:.1f}% "
+              f"(growth: {final_area / max(init_area, 1e-9):.2f}x)")
 
 
 def _print_video_summary(video, results):
@@ -282,7 +294,8 @@ def _save_results(results, out_dir, tag):
               'kp_clean', 'kp_attacked', 'L_dog_final', 'L_rtaa_final',
               'perturbation_linf_mean', 'perturbation_linf_max',
               'perturbation_l1_mean', 'perturbation_frac',
-              'amerini_iters', 'sparse_n_kps', 'sparse_area_frac']
+              'amerini_iters', 'sparse_n_kps', 'sparse_area_frac',
+              'sparse_n_refreshes', 'sparse_area_frac_final']
     with open(csv_path, 'w', newline='') as f:
         w = csv.DictWriter(f, fieldnames=fields, extrasaction='ignore')
         w.writeheader()
@@ -309,8 +322,10 @@ def _save_results(results, out_dir, tag):
         perturbation_l1_mean    = np.array([r['perturbation_l1_mean']   for r in results]),
         perturbation_frac       = np.array([r['perturbation_frac']      for r in results]),
         amerini_iters           = np.array([r['amerini_iters']          for r in results]),
-        sparse_n_kps            = np.array([r['sparse_n_kps']           for r in results]),
-        sparse_area_frac        = np.array([r['sparse_area_frac']       for r in results]),
+        sparse_n_kps            = np.array([r['sparse_n_kps']             for r in results]),
+        sparse_area_frac        = np.array([r['sparse_area_frac']         for r in results]),
+        sparse_n_refreshes      = np.array([r['sparse_n_refreshes']       for r in results]),
+        sparse_area_frac_final  = np.array([r['sparse_area_frac_final']   for r in results]),
     )
     print(f"NPZ  -> {npz_path}")
 
@@ -346,7 +361,12 @@ def main():
     parser.add_argument('--roi_source',   default='prev_pred',
                         choices=['gt', 'prev_pred'])
     parser.add_argument('--sparse_mask',  action='store_true')
-    parser.add_argument('--sparse_half_side', type=int, default=4)
+    parser.add_argument('--sparse_half_side',     type=int, default=4)
+    parser.add_argument('--sparse_refresh_every', type=int, default=0,
+                        help='Re-detect kps every K PGD iters and union-extend '
+                             'the sparse mask. Mirrors Amerini\'s outer loop. '
+                             '0 = off (single-init mask).')
+    parser.add_argument('--sparse_refresh_cap',   type=int, default=5)
 
     parser.add_argument('--amerini_sigma',          type=float, default=0.7)
     parser.add_argument('--amerini_ksize',          type=int,   default=3)
