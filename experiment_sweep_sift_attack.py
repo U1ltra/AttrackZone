@@ -125,6 +125,31 @@ def compute_metrics(log_path):
     out['sparse_area_frac']         = _mean('sparse_area_frac')
     out['sparse_n_refreshes']       = _mean('sparse_n_refreshes')
     out['sparse_area_frac_final']   = _mean('sparse_area_frac_final')
+
+    # Gradient-alignment diagnostics (NaN unless --diag_grad_alignment was
+    # set in the per-run experiment). Per-iter arrays are (NF, n_iter);
+    # collapse to start-iter / end-iter / overall scalars.
+    def _start_end_all(key):
+        if key not in d.files:
+            return (float('nan'), float('nan'), float('nan'))
+        a = d[key]
+        if a.ndim != 2 or a.size == 0:
+            return (float('nan'), float('nan'), float('nan'))
+        return (float(np.nanmean(a[:, 0])),
+                float(np.nanmean(a[:, -1])),
+                float(np.nanmean(a)))
+    cs0, csL, csM = _start_end_all('grad_cos_sim')
+    sa0, saL, saM = _start_end_all('grad_sign_agree')
+    nr0, nrL, nrM = _start_end_all('grad_norm_ratio')
+    out['grad_cos_sim_start']    = cs0
+    out['grad_cos_sim_end']      = csL
+    out['grad_cos_sim_mean']     = csM
+    out['grad_sign_agree_start'] = sa0
+    out['grad_sign_agree_end']   = saL
+    out['grad_sign_agree_mean']  = saM
+    out['grad_norm_ratio_start'] = nr0
+    out['grad_norm_ratio_end']   = nrL
+    out['grad_norm_ratio_mean']  = nrM
     return out
 
 
@@ -184,6 +209,8 @@ def run_experiment(video, seed, args):
                 '--sparse_half_side',     str(args.sparse_half_side),
                 '--sparse_refresh_every', str(args.sparse_refresh_every),
                 '--sparse_refresh_cap',   str(args.sparse_refresh_cap)]
+    if args.attack == 'rtaa_sift_frame' and args.diag_grad_alignment:
+        cmd += ['--diag_grad_alignment']
     if args.attack == 'amerini_smoothing':
         cmd += [
             '--amerini_sigma',          str(args.amerini_sigma),
@@ -231,6 +258,26 @@ def _print_perturbation_block(results, indent='    '):
         print(f"{indent}  amerini outer iters/frame: {_mean('amerini_iters'):.1f}")
 
 
+def _print_grad_align_block(results, indent='    '):
+    """Print L_rtaa vs L_dog gradient alignment summary (when populated)."""
+    def _mean(k): return np.nanmean([r[k] for r in results])
+    if not np.isfinite(_mean('grad_cos_sim_mean')):
+        return
+    print(f"{indent}L_rtaa vs L_dog gradient alignment "
+          f"(mean across runs, start->end PGD):")
+    print(f"{indent}  cos sim    : "
+          f"{_mean('grad_cos_sim_start'):+.3f} -> "
+          f"{_mean('grad_cos_sim_end'):+.3f}   "
+          f"(all-iter mean = {_mean('grad_cos_sim_mean'):+.3f})")
+    print(f"{indent}  sign agree : "
+          f"{_mean('grad_sign_agree_start'):.3f} -> "
+          f"{_mean('grad_sign_agree_end'):.3f}   "
+          f"(0.5 = random; >0.5 = agree)")
+    print(f"{indent}  |g_dog|/|g_rtaa| : "
+          f"{_mean('grad_norm_ratio_start'):.3g} -> "
+          f"{_mean('grad_norm_ratio_end'):.3g}")
+
+
 def _print_sparse_block(results, indent='    '):
     """Print sparse-mask diagnostics (when non-NaN)."""
     def _mean(k): return np.nanmean([r[k] for r in results])
@@ -259,6 +306,7 @@ def _print_video_summary(video, results):
     print(f"    kp_clean → atk  = {_m('kp_clean'):.1f} → {_m('kp_attacked'):.1f}")
     _print_perturbation_block(results, indent='    ')
     _print_sparse_block      (results, indent='    ')
+    _print_grad_align_block  (results, indent='    ')
 
 
 def _print_aggregate(results, attack_label):
@@ -284,6 +332,7 @@ def _print_aggregate(results, attack_label):
         print(f"  L_rtaa (final iter, mean over frames/runs): {_m('L_rtaa_final'):+.3f}")
     _print_perturbation_block(results, indent='  ')
     _print_sparse_block      (results, indent='  ')
+    _print_grad_align_block  (results, indent='  ')
 
 
 def _save_results(results, out_dir, tag):
@@ -295,7 +344,10 @@ def _save_results(results, out_dir, tag):
               'perturbation_linf_mean', 'perturbation_linf_max',
               'perturbation_l1_mean', 'perturbation_frac',
               'amerini_iters', 'sparse_n_kps', 'sparse_area_frac',
-              'sparse_n_refreshes', 'sparse_area_frac_final']
+              'sparse_n_refreshes', 'sparse_area_frac_final',
+              'grad_cos_sim_start', 'grad_cos_sim_end', 'grad_cos_sim_mean',
+              'grad_sign_agree_start', 'grad_sign_agree_end', 'grad_sign_agree_mean',
+              'grad_norm_ratio_start', 'grad_norm_ratio_end', 'grad_norm_ratio_mean']
     with open(csv_path, 'w', newline='') as f:
         w = csv.DictWriter(f, fieldnames=fields, extrasaction='ignore')
         w.writeheader()
@@ -326,6 +378,15 @@ def _save_results(results, out_dir, tag):
         sparse_area_frac        = np.array([r['sparse_area_frac']         for r in results]),
         sparse_n_refreshes      = np.array([r['sparse_n_refreshes']       for r in results]),
         sparse_area_frac_final  = np.array([r['sparse_area_frac_final']   for r in results]),
+        grad_cos_sim_start      = np.array([r['grad_cos_sim_start']       for r in results]),
+        grad_cos_sim_end        = np.array([r['grad_cos_sim_end']         for r in results]),
+        grad_cos_sim_mean       = np.array([r['grad_cos_sim_mean']        for r in results]),
+        grad_sign_agree_start   = np.array([r['grad_sign_agree_start']    for r in results]),
+        grad_sign_agree_end     = np.array([r['grad_sign_agree_end']      for r in results]),
+        grad_sign_agree_mean    = np.array([r['grad_sign_agree_mean']     for r in results]),
+        grad_norm_ratio_start   = np.array([r['grad_norm_ratio_start']    for r in results]),
+        grad_norm_ratio_end     = np.array([r['grad_norm_ratio_end']      for r in results]),
+        grad_norm_ratio_mean    = np.array([r['grad_norm_ratio_mean']     for r in results]),
     )
     print(f"NPZ  -> {npz_path}")
 
@@ -367,6 +428,10 @@ def main():
                              'the sparse mask. Mirrors Amerini\'s outer loop. '
                              '0 = off (single-init mask).')
     parser.add_argument('--sparse_refresh_cap',   type=int, default=5)
+    parser.add_argument('--diag_grad_alignment',  action='store_true',
+                        help='Log L_rtaa vs L_dog gradient agreement per PGD '
+                             'iter. ~2x slower (extra backward passes). Only '
+                             'meaningful for --attack rtaa_sift_frame.')
 
     parser.add_argument('--amerini_sigma',          type=float, default=0.7)
     parser.add_argument('--amerini_ksize',          type=int,   default=3)

@@ -625,6 +625,11 @@ def rtaa_sift_attack_frame(net,
                            dog_contrast=0.04, kornia_num_features=500,
                            rtaa_weight=1.0,
                            delta_init=None,
+                           # Per-iter measurement of how L_rtaa and L_dog
+                           # gradients agree, disagree, or are orthogonal in
+                           # delta-space. Logs grad_cos_sim, grad_sign_agree,
+                           # grad_norm_ratio. Costs ~2x backward per iter.
+                           compute_grad_alignment=False,
                            loss_log=None,
                            model_sz=271):
     """RTAA + SIFT-evasion attack with the perturbation parameterised at
@@ -800,6 +805,33 @@ def rtaa_sift_attack_frame(net,
             loss_log.setdefault('L_dog',    []).append(float(L_dog.detach()))
             loss_log.setdefault('L_kornia', []).append(float(L_kornia.detach()))
             loss_log.setdefault('L_total',  []).append(float(loss.detach()))
+
+        # --- Per-iter L_rtaa vs L_dog gradient agreement diagnostic ---
+        # Backward each loss term separately into delta-space to measure how
+        # the two objectives "see" the current delta. Uses torch.autograd.grad
+        # so delta.grad is not touched -- the main optimizer step below still
+        # uses the gradient of the combined `loss`.
+        if compute_grad_alignment and loss_log is not None:
+            g_rtaa = torch.autograd.grad(L_rtaa, delta, retain_graph=True,
+                                         allow_unused=True)[0]
+            g_dog  = torch.autograd.grad(L_dog,  delta, retain_graph=True,
+                                         allow_unused=True)[0]
+            if g_rtaa is None: g_rtaa = torch.zeros_like(delta)
+            if g_dog  is None: g_dog  = torch.zeros_like(delta)
+            a = g_rtaa.flatten(); b = g_dog.flatten()
+            na, nb = float(a.norm().item()), float(b.norm().item())
+            if na > 1e-12 and nb > 1e-12:
+                cos = float(torch.dot(a, b).item() / (na * nb))
+            else:
+                cos = float('nan')
+            both_nz = (a != 0) & (b != 0)
+            n_both  = int(both_nz.sum().item())
+            agree = (float(((torch.sign(a) == torch.sign(b)) & both_nz)
+                           .sum().item()) / n_both) if n_both > 0 else float('nan')
+            ratio = (nb / na) if na > 1e-12 else float('nan')
+            loss_log.setdefault('grad_cos_sim',    []).append(cos)
+            loss_log.setdefault('grad_sign_agree', []).append(agree)
+            loss_log.setdefault('grad_norm_ratio', []).append(ratio)
 
         net.zero_grad()
         if delta.grad is not None:

@@ -474,6 +474,7 @@ def simulate_attack(net, detector, image_files, gt, init_frame, sim_frames, args
                 alpha_dog=args.alpha_dog, gamma_kornia=args.gamma_kornia,
                 dog_contrast=args.dog_contrast,
                 rtaa_weight=args.rtaa_weight,
+                compute_grad_alignment=args.diag_grad_alignment,
                 loss_log=loss_log,
             )
 
@@ -699,6 +700,12 @@ def save_log(out_path, benign_log, attack_log, args):
         loss_kornia = _stack('L_kornia'),
         loss_total  = _stack('L_total'),
 
+        # Per-iter L_rtaa vs L_dog gradient alignment (only populated when
+        # --diag_grad_alignment is set; NaN-filled otherwise).
+        grad_cos_sim    = _stack('grad_cos_sim'),
+        grad_sign_agree = _stack('grad_sign_agree'),
+        grad_norm_ratio = _stack('grad_norm_ratio'),
+
         # Per-frame pixel-magnitude diagnostics. Generic — populated for any
         # attack variant except 'none', so amerini and PGD variants can be
         # compared on the same axis as --eps.
@@ -756,6 +763,26 @@ def print_summary(benign_log, attack_log, args):
                               for e in attack_log])
         print(f"  amerini outer iters used (mean): "
               f"{mean_iters:.1f} / {args.amerini_max_iter}")
+    if 'grad_cos_sim' in ll0 and ll0['grad_cos_sim']:
+        # Trajectory across PGD iters, averaged over frames.
+        cos_seq    = np.array([e['loss_log']['grad_cos_sim']
+                               for e in attack_log], dtype=np.float32)
+        agree_seq  = np.array([e['loss_log']['grad_sign_agree']
+                               for e in attack_log], dtype=np.float32)
+        ratio_seq  = np.array([e['loss_log']['grad_norm_ratio']
+                               for e in attack_log], dtype=np.float32)
+        print(f"  L_rtaa vs L_dog gradient alignment (per-iter, "
+              f"mean over frames):")
+        print(f"    cos sim    : start={np.nanmean(cos_seq[:, 0]):+.3f}   "
+              f"end={np.nanmean(cos_seq[:, -1]):+.3f}   "
+              f"all-iter mean={np.nanmean(cos_seq):+.3f}")
+        print(f"    sign agree : start={np.nanmean(agree_seq[:, 0]):.3f}   "
+              f"end={np.nanmean(agree_seq[:, -1]):.3f}   "
+              f"all-iter mean={np.nanmean(agree_seq):.3f}   "
+              f"(0.5 = random; >0.5 = agree)")
+        print(f"    |g_dog|/|g_rtaa|: start={np.nanmean(ratio_seq[:, 0]):.3g}   "
+              f"end={np.nanmean(ratio_seq[:, -1]):.3g}   "
+              f"(reflects raw L_dog vs L_rtaa scale)")
     if 'sparse_n_kps' in ll0:
         mean_n_kps = np.mean([e['loss_log']['sparse_n_kps'][0]     for e in attack_log])
         mean_area  = np.mean([e['loss_log']['sparse_area_frac'][0] for e in attack_log])
@@ -825,6 +852,13 @@ def main():
                         help='Max number of mask refreshes per attack call '
                              '(prevents the union mask from saturating to '
                              'the full R_target after many iters).')
+    parser.add_argument('--diag_grad_alignment', action='store_true',
+                        help='At every PGD iter, backward L_rtaa and L_dog '
+                             'separately into delta-space and log three '
+                             'agreement metrics: grad_cos_sim, '
+                             'grad_sign_agree, grad_norm_ratio. Costs ~2x '
+                             'backward per iter; turn on for analysis only. '
+                             'Honoured by --attack rtaa_sift_frame.')
     # --- Amerini smoothing-attack knobs (only honoured by amerini_smoothing) ---
     parser.add_argument('--amerini_sigma',          type=float, default=0.7,
                         help='Gaussian std for the per-kp smoothing (paper: 0.7)')
