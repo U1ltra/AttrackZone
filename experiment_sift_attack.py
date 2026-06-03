@@ -210,6 +210,73 @@ def count_kps_in_roi(detector, frame, bbox):
     return len(detector.extract_features(frame, mask=mask)[0])
 
 
+# ---------------------------------------------------------------------------
+# Per-frame perturbation visualization (heatmaps over the search-region crop).
+# ---------------------------------------------------------------------------
+
+def save_delta_heatmap(out_dir, frame_idx, im_clean, im_attacked,
+                       target_pos, s_x_int, r_target_frame_bbox,
+                       attack_label):
+    """Save a 4-panel viz of the per-frame perturbation localised to the
+    search-region crop:
+
+      [Clean | Attacked | |delta| magnitude | Support binary mask]
+
+    `delta` is computed as im_attacked - im_clean (int16). Works for any
+    attack variant because we don't need the attack's internal delta tensor.
+
+    Writes `{out_dir}/delta_f{frame_idx:04d}.png`.
+    """
+    import matplotlib.pyplot as plt
+    from matplotlib.patches import Rectangle
+
+    H, W = im_clean.shape[:2]
+    cx, cy = int(round(target_pos[0])), int(round(target_pos[1]))
+    x1 = cx - s_x_int // 2; y1 = cy - s_x_int // 2
+    x2 = x1 + s_x_int;       y2 = y1 + s_x_int
+    ix1, iy1 = max(0, x1), max(0, y1)
+    ix2, iy2 = min(W, x2), min(H, y2)
+    if ix2 <= ix1 or iy2 <= iy1:
+        return  # crop fell entirely outside the frame
+
+    clean_crop    = im_clean   [iy1:iy2, ix1:ix2]
+    attacked_crop = im_attacked[iy1:iy2, ix1:ix2]
+    delta_crop    = (attacked_crop.astype(np.int16)
+                     - clean_crop.astype(np.int16))
+    abs_d   = np.abs(delta_crop).max(axis=-1)               # (H, W)
+    touched = (np.abs(delta_crop).sum(axis=-1) > 0).astype(np.float32)
+
+    # R_target bbox in crop-relative coords
+    rx, ry, rw, rh = r_target_frame_bbox
+    rx_c, ry_c = float(rx) - ix1, float(ry) - iy1
+
+    fig, axes = plt.subplots(1, 4, figsize=(17, 4.5))
+    axes[0].imshow(cv2.cvtColor(clean_crop,    cv2.COLOR_BGR2RGB))
+    axes[0].set_title('Clean crop')
+    axes[1].imshow(cv2.cvtColor(attacked_crop, cv2.COLOR_BGR2RGB))
+    axes[1].set_title('Attacked crop')
+
+    im3 = axes[2].imshow(abs_d, cmap='hot', vmin=0)
+    axes[2].set_title(f'|delta| magnitude  (max={int(abs_d.max())})')
+    plt.colorbar(im3, ax=axes[2], fraction=0.046, pad=0.02)
+
+    axes[3].imshow(touched, cmap='gray', vmin=0, vmax=1)
+    axes[3].set_title(f'Support  ({100.0 * touched.mean():.2f}% touched)')
+
+    for ax in axes[:2]:
+        ax.add_patch(Rectangle((rx_c, ry_c), rw, rh,
+                               edgecolor='cyan', facecolor='none', linewidth=1.2))
+    for ax in axes:
+        ax.set_xticks([]); ax.set_yticks([])
+
+    fig.suptitle(f'{attack_label}  --  frame {frame_idx}', fontsize=13)
+    fig.tight_layout()
+    os.makedirs(out_dir, exist_ok=True)
+    fig.savefig(join(out_dir, f'delta_f{frame_idx:04d}.png'),
+                dpi=80, bbox_inches='tight')
+    plt.close(fig)
+
+
 def build_kp_sparse_mask(detector, frame, r_target_frame_bbox,
                          target_pos, s_x_int, half_side=4):
     """Build a {0,1} spatial-sparsity mask for the gradient attack.
@@ -563,6 +630,10 @@ def simulate_attack(net, detector, image_files, gt, init_frame, sim_frames, args
             'pred_bbox':       pred_bbox.copy(),
             'gt_bbox':         gt[f].copy(),
             'r_target_bbox':   np.asarray(r_target_frame, dtype=np.float32),
+            # Center the search crop is built around at this frame (= previous-
+            # frame tracker prediction). Saved so the heatmap viz can re-derive
+            # the s_x crop region without re-running the attack.
+            'target_pos':      target_pos.copy(),
             'iou_gt':          _bbox_iou(pred_bbox, gt[f]),
             'kp_clean':        int(kp_clean),
             'kp_attacked':     int(kp_attacked),
@@ -873,6 +944,11 @@ def main():
                         help='Early-stop once removal_rate >= this. '
                              '1.0 = run until no kps left (or hit max_iter).')
     parser.add_argument('--no_video', action='store_true')
+    parser.add_argument('--save_viz', action='store_true',
+                        help='Save per-frame heatmap PNGs of the perturbation '
+                             '(clean | attacked | |delta| | support) to '
+                             '{out_dir}/{stem}_viz/. Compare runs by viewing '
+                             'two viz dirs side-by-side.')
     args = parser.parse_args()
 
     if args.seed is None:
@@ -916,6 +992,19 @@ def main():
         render_video(detector, image_files, benign_log, attack_log,
                      video_path, args.attack)
         print(f"Video -> {video_path}")
+
+    if args.save_viz:
+        viz_dir = join(args.out_dir, f"{stem}_viz")
+        for a_e in attack_log:
+            im_clean = cv2.imread(image_files[a_e['frame_idx']])
+            save_delta_heatmap(
+                viz_dir, a_e['frame_idx'], im_clean, a_e['im_attacked'],
+                target_pos=a_e['target_pos'],
+                s_x_int=a_e['s_x_int'],
+                r_target_frame_bbox=a_e['r_target_bbox'],
+                attack_label=args.attack,
+            )
+        print(f"Viz  -> {viz_dir}/  ({len(attack_log)} frames)")
 
     print_summary(benign_log, attack_log, args)
 

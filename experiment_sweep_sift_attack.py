@@ -211,6 +211,8 @@ def run_experiment(video, seed, args):
                 '--sparse_refresh_cap',   str(args.sparse_refresh_cap)]
     if args.attack == 'rtaa_sift_frame' and args.diag_grad_alignment:
         cmd += ['--diag_grad_alignment']
+    if args.save_viz:
+        cmd += ['--save_viz']
     if args.attack == 'amerini_smoothing':
         cmd += [
             '--amerini_sigma',          str(args.amerini_sigma),
@@ -432,6 +434,10 @@ def main():
                         help='Log L_rtaa vs L_dog gradient agreement per PGD '
                              'iter. ~2x slower (extra backward passes). Only '
                              'meaningful for --attack rtaa_sift_frame.')
+    parser.add_argument('--save_viz', action='store_true',
+                        help='Per-frame perturbation heatmap PNGs. Generates '
+                             'NF * #(video, seed) PNGs -- use on small sweeps '
+                             'only.')
 
     parser.add_argument('--amerini_sigma',          type=float, default=0.7)
     parser.add_argument('--amerini_ksize',          type=int,   default=3)
