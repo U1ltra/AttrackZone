@@ -166,7 +166,11 @@ def _variant_tag(args):
         parts.append(f'dc{args.dog_contrast:g}')
         parts.append(f'rw{args.rtaa_weight:g}')
     if args.attack == 'rtaa_sift_frame' and args.sparse_mask:
-        parts.append(f'sm{args.sparse_half_side}')
+        # 'smk' = sparse-mask-on-kp-gradient-only (gates g_dog/g_kornia, not
+        # g_rtaa). Older 'sm{N}'-tagged logs used a different semantic (mask
+        # applied to final delta, constraining both objectives); keep the tag
+        # distinct so prior sweeps stay loadable as a comparison baseline.
+        parts.append(f'smk{args.sparse_half_side}')
         if args.sparse_refresh_every > 0:
             parts.append(f'rf{args.sparse_refresh_every}c{args.sparse_refresh_cap}')
     if args.attack == 'amerini_smoothing':

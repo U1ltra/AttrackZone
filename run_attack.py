@@ -806,18 +806,32 @@ def rtaa_sift_attack_frame(net,
             loss_log.setdefault('L_kornia', []).append(float(L_kornia.detach()))
             loss_log.setdefault('L_total',  []).append(float(loss.detach()))
 
-        # --- Per-iter L_rtaa vs L_dog gradient agreement diagnostic ---
-        # Backward each loss term separately into delta-space to measure how
-        # the two objectives "see" the current delta. Uses torch.autograd.grad
-        # so delta.grad is not touched -- the main optimizer step below still
-        # uses the gradient of the combined `loss`.
+        # Per-loss gradients. The sparse mask (when supplied) is a kp-derived
+        # spatial prior: Amerini's analysis says small delta near kps is enough
+        # to remove them. That prior has no bearing on L_rtaa -- SiamRPN's
+        # cross-correlation makes every search-region pixel matter for every
+        # anchor. So we gate the mask onto g_dog / g_kornia only and let g_rtaa
+        # see the full grid. When rtaa_weight == 0 this reduces to the prior
+        # "fully masked delta" behaviour (sign(0) outside the mask = 0).
+        net.zero_grad()
+        if delta.grad is not None:
+            delta.grad.data.zero_()
+
+        g_rtaa = torch.autograd.grad(L_rtaa, delta, retain_graph=True,
+                                     allow_unused=True)[0]
+        g_dog  = torch.autograd.grad(L_dog,  delta, retain_graph=True,
+                                     allow_unused=True)[0]
+        if gamma_kornia > 0:
+            g_kornia = torch.autograd.grad(L_kornia, delta, retain_graph=True,
+                                           allow_unused=True)[0]
+        else:
+            g_kornia = None
+        if g_rtaa  is None: g_rtaa  = torch.zeros_like(delta)
+        if g_dog   is None: g_dog   = torch.zeros_like(delta)
+        if g_kornia is None and gamma_kornia > 0:
+            g_kornia = torch.zeros_like(delta)
+
         if compute_grad_alignment and loss_log is not None:
-            g_rtaa = torch.autograd.grad(L_rtaa, delta, retain_graph=True,
-                                         allow_unused=True)[0]
-            g_dog  = torch.autograd.grad(L_dog,  delta, retain_graph=True,
-                                         allow_unused=True)[0]
-            if g_rtaa is None: g_rtaa = torch.zeros_like(delta)
-            if g_dog  is None: g_dog  = torch.zeros_like(delta)
             a = g_rtaa.flatten(); b = g_dog.flatten()
             na, nb = float(a.norm().item()), float(b.norm().item())
             if na > 1e-12 and nb > 1e-12:
@@ -833,19 +847,19 @@ def rtaa_sift_attack_frame(net,
             loss_log.setdefault('grad_sign_agree', []).append(agree)
             loss_log.setdefault('grad_norm_ratio', []).append(ratio)
 
-        net.zero_grad()
-        if delta.grad is not None:
-            delta.grad.data.zero_()
-        loss.backward(retain_graph=True)
+        if attack_mask_frame is not None:
+            g_combined = rtaa_weight * g_rtaa + alpha_dog * (g_dog * attack_mask_frame)
+            if gamma_kornia > 0:
+                g_combined = g_combined + gamma_kornia * (g_kornia * attack_mask_frame)
+        else:
+            g_combined = rtaa_weight * g_rtaa + alpha_dog * g_dog
+            if gamma_kornia > 0:
+                g_combined = g_combined + gamma_kornia * g_kornia
 
-        grad_sign = torch.sign(delta.grad)
-        delta = delta - alpha * grad_sign
-
+        delta = delta - alpha * torch.sign(g_combined)
         delta = torch.clamp(delta, -eps, eps)
         # Keep x_clean + delta in valid pixel range
         delta = torch.clamp(x_clean_frame + delta, x_val_min, x_val_max) - x_clean_frame
-        if attack_mask_frame is not None:
-            delta = delta * attack_mask_frame
         delta = Variable(delta.detach(), requires_grad=True)
 
     x_adv_frame = torch.clamp(x_clean_frame + delta, x_val_min, x_val_max)
