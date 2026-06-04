@@ -47,6 +47,7 @@ from run_attack import (
     rtaa_attack,
     rtaa_sift_attack,
     rtaa_sift_attack_frame,
+    rtaa_amerini_combined_attack_frame,
 )
 from utils import rect_2_cxy_wh, cxy_wh_2_rect, get_subwindow_tracking
 from sift_alignment import SIFTAlignmentDetector
@@ -568,6 +569,25 @@ def simulate_attack(net, detector, image_files, gt, init_frame, sim_frames, args
             loss_log['amerini_kp_init']  = [float(kp_amer_init)]
             loss_log['amerini_kp_final'] = [float(kp_amer_final)]
 
+        elif args.attack == 'rtaa_amerini':
+            x_frame_clean = _extract_x_crop_frame(state, im, s_x_int)
+            r_target_crop = frame_bbox_to_crop_bbox_frame_res(
+                r_target_frame, target_pos, s_x_int
+            )
+            delta_frame_t, x_for_tracker = rtaa_amerini_combined_attack_frame(
+                net, x_frame_clean, prev_pred_bbox,
+                target_pos, target_sz, scale_z, p,
+                r_target_crop_bbox=r_target_crop,
+                detector=detector,
+                eps=args.eps, iteration=args.n_iter,
+                final_pos=final_pos, im_bounds=im_bounds,
+                amer_sigma=args.amerini_sigma,
+                amer_ksize=args.amerini_ksize,
+                amer_patch_half=args.amerini_patch_half,
+                rtaa_weight=args.rtaa_weight,
+                loss_log=loss_log,
+            )
+
         else:
             raise ValueError(f"unknown --attack {args.attack}")
 
@@ -576,7 +596,7 @@ def simulate_attack(net, detector, image_files, gt, init_frame, sim_frames, args
             im_attacked = im.copy()
         elif args.attack == 'amerini_smoothing':
             im_attacked = im_attacked_pre
-        elif args.attack == 'rtaa_sift_frame':
+        elif args.attack in ('rtaa_sift_frame', 'rtaa_amerini'):
             im_attacked = inject_frame_res(im, delta_frame_t, target_pos, s_x_int)
         else:
             im_attacked = inject_crop_res(im, x_for_tracker - x_271,
@@ -794,6 +814,11 @@ def save_log(out_path, benign_log, attack_log, args):
         sparse_area_frac         = _stack_scalar('sparse_area_frac'),
         sparse_n_refreshes       = _stack_scalar('sparse_n_refreshes'),
         sparse_area_frac_final   = _stack_scalar('sparse_area_frac_final'),
+
+        # Per-frame rtaa_amerini diagnostics (NaN unless --attack rtaa_amerini)
+        amer_frozen_frac_final   = _stack_scalar('amer_frozen_frac_final'),
+        amer_n_kps_init          = _stack_scalar('amer_n_kps_init'),
+        amer_n_kps_final         = _stack_scalar('amer_n_kps_final'),
     )
 
 
@@ -813,9 +838,12 @@ def print_summary(benign_log, attack_log, args):
     ll0 = attack_log[0]['loss_log'] if attack_log else {}
     if 'L_rtaa' in ll0 and ll0['L_rtaa']:
         rtaa0, rtaa1 = ll0['L_rtaa'][0],  ll0['L_rtaa'][-1]
-        dog0,  dog1  = ll0['L_dog'][0],   ll0['L_dog'][-1]
-        print(f"  frame 0 L_rtaa: {rtaa0:+.3f} -> {rtaa1:+.3f}   "
-              f"L_dog: {dog0:.4f} -> {dog1:.4f}")
+        if 'L_dog' in ll0 and ll0['L_dog']:
+            dog0, dog1 = ll0['L_dog'][0], ll0['L_dog'][-1]
+            print(f"  frame 0 L_rtaa: {rtaa0:+.3f} -> {rtaa1:+.3f}   "
+                  f"L_dog: {dog0:.4f} -> {dog1:.4f}")
+        else:
+            print(f"  frame 0 L_rtaa: {rtaa0:+.3f} -> {rtaa1:+.3f}")
     if 'perturbation_linf' in ll0:
         mean_linf = np.mean([e['loss_log']['perturbation_linf'][0]
                              for e in attack_log])
@@ -887,7 +915,8 @@ def main():
 
     parser.add_argument('--attack', default='rtaa_sift_frame',
                         choices=['none', 'rtaa', 'rtaa_sift_crop',
-                                 'rtaa_sift_frame', 'amerini_smoothing'])
+                                 'rtaa_sift_frame', 'amerini_smoothing',
+                                 'rtaa_amerini'])
     parser.add_argument('--eps',          type=float, default=16.0,
                         help='L_inf perturbation budget in pixel units')
     parser.add_argument('--n_iter',       type=int,   default=10)

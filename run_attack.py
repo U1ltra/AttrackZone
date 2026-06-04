@@ -874,6 +874,236 @@ def rtaa_sift_attack_frame(net,
     return delta.detach(), x_adv_271.detach()
 
 
+def rtaa_amerini_combined_attack_frame(net,
+                                       x_clean_frame, gt, target_pos, target_sz,
+                                       scale_z, p,
+                                       r_target_crop_bbox,
+                                       detector,
+                                       eps=10, iteration=5,
+                                       x_val_min=0, x_val_max=255,
+                                       pscore_weight=50.0,
+                                       pseudo_iou_thresh=0.1,
+                                       truth_suppress_iou_thresh=0.1,
+                                       final_pos=None, im_bounds=None,
+                                       amer_sigma=0.7,
+                                       amer_ksize=3,
+                                       amer_patch_half=4,
+                                       rtaa_weight=1.0,
+                                       loss_log=None,
+                                       model_sz=271):
+    """Combined attack: Amerini smoothing on kp windows + L_rtaa PGD on the
+    spatially-disjoint complement.
+
+    Per-iter loop, mirroring Amerini's outer loop interleaved with PGD:
+      1. Re-detect SIFT kps inside R_target on the currently attacked crop.
+      2. Build a window mask around those kps; union-extend a 'frozen' mask
+         (once a pixel is owned by Amerini it is never returned to PGD).
+      3. cv2.GaussianBlur the current attacked crop and write blurred values
+         into x_amer at the NEW (just-frozen) pixels. Zero delta_track there
+         to preserve disjointness.
+      4. Forward (x_amer + delta_track) through the tracker, backward L_rtaa
+         into delta_track, sign-step on g_rtaa * (1 - frozen_mask), then
+         project delta_track into the eps box.
+
+    The two perturbations are spatially disjoint by construction, so the
+    Amerini side contributes no L_inf budget pressure on the PGD side --
+    `eps` bounds only the PGD contribution.
+
+    Returns
+    -------
+    delta_total : (1, 3, s_x_int, s_x_int) torch float, x_final - x_clean.
+                  Use the same inject_frame_res rendering path as the other
+                  frame-res attacks.
+    x_adv_271   : tracker input at model resolution.
+    """
+    device = x_clean_frame.device
+    x_clean_frame = x_clean_frame.detach()
+    _, _, H, W = x_clean_frame.shape
+
+    if amer_ksize % 2 == 0:
+        amer_ksize += 1
+    alpha = eps * 1.0 / iteration
+
+    if final_pos is None or im_bounds is None:
+        rate_xy1 = 0.3; rate_xy2 = 0.3; rate_wd = 1.0
+    else:
+        rate_xy1 = (final_pos[0] - target_pos[0]) / target_sz[0]
+        rate_xy2 = (final_pos[1] - target_pos[1]) / target_sz[1]
+        rate_wd  = final_pos[2] / target_sz[0]
+
+    score_size_int = int(p.score_size)
+    win_2d = np.outer(np.hanning(score_size_int), np.hanning(score_size_int))
+    window_np = np.tile(win_2d.flatten(), p.anchor_num).astype(np.float32)
+    window_t = torch.from_numpy(window_np).cuda()
+
+    tsz_scaled = np.asarray(target_sz, dtype=np.float32) * scale_z
+    tsz0 = torch.tensor(float(tsz_scaled[0])).cuda()
+    tsz1 = torch.tensor(float(tsz_scaled[1])).cuda()
+    anchor_w_t = torch.from_numpy(p.anchor[:, 2].astype(np.float32)).cuda()
+    anchor_h_t = torch.from_numpy(p.anchor[:, 3].astype(np.float32)).cuda()
+
+    def _change_t(r):
+        return torch.maximum(r, 1.0 / r)
+
+    def _sz_t(w, h):
+        pad = (w + h) * 0.5
+        return torch.sqrt((w + pad) * (h + pad))
+
+    target_sz_norm = _sz_t(tsz0, tsz1)
+    target_ratio = tsz0 / tsz1
+
+    # x_amer accumulates Amerini's smoothing at frozen pixels; starts as clean.
+    # delta_track is the PGD perturbation, always zero where frozen_mask == 1.
+    x_amer = x_clean_frame.clone()
+    delta_track = torch.zeros_like(x_clean_frame, requires_grad=True)
+    frozen_mask = torch.zeros(1, 1, H, W, device=device)
+
+    n_kp_iter_list = []
+
+    for i in range(iteration):
+        # --- (1)-(3) Amerini update on the currently attacked image ---
+        with torch.no_grad():
+            x_work_det = torch.clamp(x_amer + delta_track.detach(),
+                                     x_val_min, x_val_max)
+            kp_mask_iter, n_kp = _rebuild_sparse_mask_in_crop(
+                detector, x_work_det, r_target_crop_bbox,
+                half_side=amer_patch_half,
+            )
+            n_kp_iter_list.append(int(n_kp))
+
+            new_pixels = (kp_mask_iter * (1.0 - frozen_mask)).clamp_(0.0, 1.0)
+            if float(new_pixels.sum().item()) > 0.0:
+                x_np = x_work_det.squeeze(0).permute(1, 2, 0).cpu().numpy()
+                x_np = np.clip(x_np, 0, 255).astype(np.uint8)
+                blurred = cv2.GaussianBlur(x_np, (amer_ksize, amer_ksize),
+                                           amer_sigma)
+                blurred_t = torch.from_numpy(
+                    blurred.astype(np.float32).transpose(2, 0, 1)
+                ).unsqueeze(0).to(device)
+                x_amer = x_amer * (1.0 - new_pixels) + blurred_t * new_pixels
+                # Preserve disjointness: kill any PGD content at newly frozen.
+                delta_track.data.mul_(1.0 - new_pixels)
+
+            frozen_mask = torch.maximum(frozen_mask, kp_mask_iter)
+
+        # --- (4) PGD step on the complement of frozen_mask ---
+        x_work = x_amer + delta_track  # delta_track has requires_grad
+        x_adv_271 = F.interpolate(x_work, size=(model_sz, model_sz),
+                                  mode='bilinear', align_corners=False)
+
+        d_out, score_out = net(x_adv_271)
+        score_temp = score_out.permute(1, 2, 3, 0).contiguous().view(2, -1)
+        score = torch.transpose(score_temp, 0, 1)
+        delta1 = d_out.permute(1, 2, 3, 0).contiguous().view(4, -1)
+        delta_np = d_out.permute(1, 2, 3, 0).contiguous().view(4, -1).data.cpu().numpy()
+
+        gt_cen = rect_2_cxy_wh(gt)
+        gt_cen = np.tile(gt_cen, (p.anchor.shape[0], 1))
+        gt_cen[:, 0] = ((gt_cen[:, 0] - target_pos[0]) * scale_z - p.anchor[:, 0]) / p.anchor[:, 2]
+        gt_cen[:, 1] = ((gt_cen[:, 1] - target_pos[1]) * scale_z - p.anchor[:, 1]) / p.anchor[:, 3]
+        gt_cen[:, 2] = np.log(gt_cen[:, 2] * scale_z) / p.anchor[:, 2]
+        gt_cen[:, 3] = np.log(gt_cen[:, 3] * scale_z) / p.anchor[:, 3]
+
+        gt_cen_pseudo = rect_2_cxy_wh(gt)
+        gt_cen_pseudo = np.tile(gt_cen_pseudo, (p.anchor.shape[0], 1))
+        gt_cen_pseudo[:, 0] = ((gt_cen_pseudo[:, 0] - target_pos[0] - rate_xy1 * gt_cen_pseudo[:, 2]) * scale_z - p.anchor[:, 0]) / p.anchor[:, 2]
+        gt_cen_pseudo[:, 1] = ((gt_cen_pseudo[:, 1] - target_pos[1] - rate_xy2 * gt_cen_pseudo[:, 3]) * scale_z - p.anchor[:, 1]) / p.anchor[:, 3]
+        gt_cen_pseudo[:, 2] = np.log(gt_cen_pseudo[:, 2] * rate_wd * scale_z) / p.anchor[:, 2]
+        gt_cen_pseudo[:, 3] = np.log(gt_cen_pseudo[:, 3] * rate_wd * scale_z) / p.anchor[:, 3]
+
+        delta_np[0, :] = (delta_np[0, :] * p.anchor[:, 2] + p.anchor[:, 0]) / scale_z + target_pos[0]
+        delta_np[1, :] = (delta_np[1, :] * p.anchor[:, 3] + p.anchor[:, 1]) / scale_z + target_pos[1]
+        delta_np[2, :] = (np.exp(delta_np[2, :]) * p.anchor[:, 2]) / scale_z
+        delta_np[3, :] = (np.exp(delta_np[3, :]) * p.anchor[:, 3]) / scale_z
+        location = np.array([delta_np[0] - delta_np[2] / 2, delta_np[1] - delta_np[3] / 2,
+                             delta_np[2], delta_np[3]])
+
+        label = overlap_ratio(location, gt)
+        pseudo_box = np.array([gt[0] + rate_xy1 * gt[2],
+                               gt[1] + rate_xy2 * gt[3],
+                               gt[2] * rate_wd,
+                               gt[3] * rate_wd], dtype=np.float32)
+        label_pseudo = overlap_ratio(location, pseudo_box)
+
+        iou_hi = 0.7; iou_low = 0.3
+        y_pos = torch.from_numpy(np.where(label > iou_hi, 1, 0)).cuda().long()
+        y_neg = torch.from_numpy(np.where(label < iou_low, 0, 1)).cuda().long()
+        pos_index = np.where(y_pos.cpu() == 1)
+        neg_index = np.where(y_neg.cpu() == 0)
+        index = np.concatenate((pos_index[0], neg_index[0]))
+        y_pos_pseudo = torch.from_numpy(np.where(label > iou_hi, 0, 1)).cuda().long()
+
+        loss_truth_cls  = -F.cross_entropy(score[index], y_pos[index])
+        loss_pseudo_cls = -F.cross_entropy(score[index], y_pos_pseudo[index])
+        loss_cls = (loss_truth_cls - loss_pseudo_cls) * 1
+
+        loss_truth_reg  = -rpn_smoothL1(delta1, gt_cen,        y_pos)
+        loss_pseudo_reg = -rpn_smoothL1(delta1, gt_cen_pseudo, y_pos)
+        loss_reg = (loss_truth_reg - loss_pseudo_reg) * 5
+
+        sm_score = F.softmax(score, dim=1)[:, 1]
+        w_pred = torch.exp(delta1[2, :]) * anchor_w_t
+        h_pred = torch.exp(delta1[3, :]) * anchor_h_t
+        s_c = _change_t(_sz_t(w_pred, h_pred) / target_sz_norm)
+        r_c = _change_t(target_ratio / (w_pred / h_pred))
+        penalty = torch.exp(-(r_c * s_c - 1.0) * p.penalty_k)
+        pscore_t = penalty * sm_score * (1.0 - p.window_influence) + window_t * p.window_influence
+
+        pseudo_mask = torch.from_numpy((label_pseudo > pseudo_iou_thresh).astype(np.float32)).cuda()
+        truth_mask  = torch.from_numpy((label > truth_suppress_iou_thresh).astype(np.float32)).cuda()
+        n_p = pseudo_mask.sum().clamp_min(1.0)
+        n_t = truth_mask.sum().clamp_min(1.0)
+        loss_pscore_pseudo = -(pscore_t * pseudo_mask).sum() / n_p
+        loss_pscore_truth  =  (pscore_t * truth_mask ).sum() / n_t
+        loss_pscore = (loss_pscore_pseudo + loss_pscore_truth) * pscore_weight
+
+        L_rtaa = loss_cls + loss_reg + loss_pscore
+
+        if loss_log is not None:
+            loss_log.setdefault('L_rtaa', []).append(float(L_rtaa.detach()))
+            loss_log.setdefault('amer_n_kps_iter', []).append(float(n_kp))
+            loss_log.setdefault('amer_frozen_frac',
+                                []).append(float(frozen_mask.mean().item()))
+
+        net.zero_grad()
+        if delta_track.grad is not None:
+            delta_track.grad.data.zero_()
+
+        # rtaa_weight scales the step magnitude only when < 1; with sign-step
+        # the direction is what matters, so keeping the multiplier here lets
+        # the user dial the tracking pressure independently of the schedule.
+        g_rtaa = torch.autograd.grad(L_rtaa, delta_track, allow_unused=True)[0]
+        if g_rtaa is None:
+            g_rtaa = torch.zeros_like(delta_track)
+
+        g_masked = g_rtaa * (1.0 - frozen_mask)
+        delta_track = delta_track - alpha * rtaa_weight * torch.sign(g_masked)
+        delta_track = torch.clamp(delta_track, -eps, eps)
+        # Pixel-range clamp via x_clean (non-frozen pixels evolve from x_clean
+        # under PGD; frozen pixels evolve from x_amer and stay in range there).
+        delta_track = torch.clamp(x_clean_frame + delta_track,
+                                  x_val_min, x_val_max) - x_clean_frame
+        delta_track = delta_track * (1.0 - frozen_mask)
+        delta_track = Variable(delta_track.detach(), requires_grad=True)
+
+    x_final = torch.clamp(x_amer + delta_track, x_val_min, x_val_max)
+    x_adv_271 = F.interpolate(x_final, size=(model_sz, model_sz),
+                              mode='bilinear', align_corners=False)
+    delta_total = (x_final - x_clean_frame).detach()
+
+    if loss_log is not None:
+        loss_log.setdefault('amer_frozen_frac_final',
+                            []).append(float(frozen_mask.mean().item()))
+        loss_log.setdefault('amer_n_kps_init',
+                            []).append(float(n_kp_iter_list[0]
+                                             if n_kp_iter_list else 0))
+        loss_log.setdefault('amer_n_kps_final',
+                            []).append(float(n_kp_iter_list[-1]
+                                             if n_kp_iter_list else 0))
+
+    return delta_total, x_adv_271.detach()
+
+
 def tracker_eval(net, x_crop, target_pos, target_sz, window, scale_z, p, f, gt, state):
     delta, score = net(x_crop)
 

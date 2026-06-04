@@ -177,6 +177,10 @@ def _variant_tag(args):
         parts.append(f'as{args.amerini_sigma:g}')
         parts.append(f'ah{args.amerini_patch_half}')
         parts.append(f'ai{args.amerini_max_iter}')
+    if args.attack == 'rtaa_amerini':
+        parts.append(f'rw{args.rtaa_weight:g}')
+        parts.append(f'as{args.amerini_sigma:g}')
+        parts.append(f'ah{args.amerini_patch_half}')
     return '_'.join(parts)
 
 
@@ -224,6 +228,12 @@ def run_experiment(video, seed, args):
             '--amerini_patch_half',     str(args.amerini_patch_half),
             '--amerini_max_iter',       str(args.amerini_max_iter),
             '--amerini_target_removal', str(args.amerini_target_removal),
+        ]
+    if args.attack == 'rtaa_amerini':
+        cmd += [
+            '--amerini_sigma',      str(args.amerini_sigma),
+            '--amerini_ksize',      str(args.amerini_ksize),
+            '--amerini_patch_half', str(args.amerini_patch_half),
         ]
 
     r = subprocess.run(cmd, capture_output=True, text=True)
@@ -418,7 +428,8 @@ def main():
     # Mirror experiment_sift_attack.py's attack-config args
     parser.add_argument('--attack', default='rtaa_sift_frame',
                         choices=['none', 'rtaa', 'rtaa_sift_crop',
-                                 'rtaa_sift_frame', 'amerini_smoothing'])
+                                 'rtaa_sift_frame', 'amerini_smoothing',
+                                 'rtaa_amerini'])
     parser.add_argument('--eps',          type=float, default=16.0)
     parser.add_argument('--n_iter',       type=int,   default=10)
     parser.add_argument('--alpha_dog',    type=float, default=1000.0)
