@@ -602,6 +602,58 @@ def simulate_attack(net, detector, image_files, gt, init_frame, sim_frames, args
             loss_log['amerini_kp_init']  = [float(kp_amer_init)]
             loss_log['amerini_kp_final'] = [float(kp_amer_final)]
 
+        elif args.attack == 'rtaa_then_amerini':
+            # Stage 1: pure RTAA at frame resolution (alpha_dog=0, no kp
+            # objective). Produces a PGD-attacked frame.
+            x_frame_clean = _extract_x_crop_frame(state, im, s_x_int)
+            r_target_crop = frame_bbox_to_crop_bbox_frame_res(
+                r_target_frame, target_pos, s_x_int
+            )
+            delta_pgd_t, _ = rtaa_sift_attack_frame(
+                net, x_frame_clean, prev_pred_bbox,
+                target_pos, target_sz, scale_z, p,
+                r_target_crop_bbox=r_target_crop,
+                eps=args.eps, iteration=args.n_iter,
+                final_pos=final_pos, im_bounds=im_bounds,
+                alpha_dog=0.0, gamma_kornia=0.0,
+                rtaa_weight=1.0,
+                loss_log=loss_log,
+            )
+            im_pgd = inject_frame_res(im, delta_pgd_t, target_pos, s_x_int)
+
+            # Stage 2: run the reference amerini_smoothing_attack on top of
+            # the PGD-attacked frame, inside R_target.
+            im_attacked_pre, n_amerini, kp_amer_final, kp_amer_init = (
+                amerini_smoothing_attack(
+                    im_pgd, r_target_frame, detector,
+                    sigma=args.amerini_sigma,
+                    gaussian_ksize=args.amerini_ksize,
+                    patch_half=args.amerini_patch_half,
+                    max_iter=args.amerini_max_iter,
+                    target_removal=args.amerini_target_removal,
+                )
+            )
+
+            # Diagnostic: fraction of R_target pixels modified by stage 2
+            # only (the keypoint-perturbation footprint). Stage 1's PGD
+            # footprint is captured separately by perturbation_frac.
+            roi_mask = _bbox_to_image_mask(im.shape, r_target_frame).astype(bool)
+            diff_kp  = np.abs(im_attacked_pre.astype(np.int16)
+                              - im_pgd.astype(np.int16)).sum(axis=-1) > 0
+            kp_pert_mask = diff_kp & roi_mask
+            roi_area     = int(roi_mask.sum())
+            kp_pert_frac = (float(kp_pert_mask.sum()) / max(roi_area, 1))
+
+            x_for_tracker = Variable(get_subwindow_tracking(
+                im_attacked_pre, target_pos, p.instance_size,
+                round(s_x), state['avg_chans']
+            ).unsqueeze(0)).cuda()
+            delta_frame_t = None
+            loss_log['amerini_iters']     = [float(n_amerini)]
+            loss_log['amerini_kp_init']   = [float(kp_amer_init)]
+            loss_log['amerini_kp_final']  = [float(kp_amer_final)]
+            loss_log['kp_pert_frac_roi']  = [float(kp_pert_frac)]
+
         elif args.attack == 'rtaa_amerini':
             x_frame_clean = _extract_x_crop_frame(state, im, s_x_int)
             r_target_crop = frame_bbox_to_crop_bbox_frame_res(
@@ -627,7 +679,7 @@ def simulate_attack(net, detector, image_files, gt, init_frame, sim_frames, args
         # Render the attacked frame
         if args.attack == 'none':
             im_attacked = im.copy()
-        elif args.attack == 'amerini_smoothing':
+        elif args.attack in ('amerini_smoothing', 'rtaa_then_amerini'):
             im_attacked = im_attacked_pre
         elif args.attack in ('rtaa_sift_frame', 'rtaa_amerini'):
             im_attacked = inject_frame_res(im, delta_frame_t, target_pos, s_x_int)
@@ -852,6 +904,11 @@ def save_log(out_path, benign_log, attack_log, args):
         amer_kp_frac_final       = _stack_scalar('amer_kp_frac_final'),
         amer_n_kps_init          = _stack_scalar('amer_n_kps_init'),
         amer_n_kps_final         = _stack_scalar('amer_n_kps_final'),
+
+        # Per-frame rtaa_then_amerini diagnostic: fraction of R_target pixels
+        # modified by the stage-2 Amerini smoothing (kp-perturbation footprint
+        # only; PGD footprint is in perturbation_frac).
+        kp_pert_frac_roi         = _stack_scalar('kp_pert_frac_roi'),
     )
 
 
@@ -949,7 +1006,7 @@ def main():
     parser.add_argument('--attack', default='rtaa_sift_frame',
                         choices=['none', 'rtaa', 'rtaa_sift_crop',
                                  'rtaa_sift_frame', 'amerini_smoothing',
-                                 'rtaa_amerini'])
+                                 'rtaa_amerini', 'rtaa_then_amerini'])
     parser.add_argument('--eps',          type=float, default=16.0,
                         help='L_inf perturbation budget in pixel units')
     parser.add_argument('--n_iter',       type=int,   default=10)
