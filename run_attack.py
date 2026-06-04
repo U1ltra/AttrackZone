@@ -892,21 +892,23 @@ def rtaa_amerini_combined_attack_frame(net,
                                        loss_log=None,
                                        model_sz=271):
     """Combined attack: Amerini smoothing on kp windows + L_rtaa PGD on the
-    spatially-disjoint complement.
+    per-iter spatially-disjoint complement.
 
     Per-iter loop, mirroring Amerini's outer loop interleaved with PGD:
       1. Re-detect SIFT kps inside R_target on the currently attacked crop.
-      2. Build a window mask around those kps; union-extend a 'frozen' mask
-         (once a pixel is owned by Amerini it is never returned to PGD).
-      3. cv2.GaussianBlur the current attacked crop and write blurred values
-         into x_amer at the NEW (just-frozen) pixels. Zero delta_track there
-         to preserve disjointness.
+      2. Build a per-iter kp window mask kp_mask_iter.
+      3. cv2.GaussianBlur the current attacked crop and paste blurred values
+         into x_amer at ALL pixels in kp_mask_iter (matches the reference
+         `amerini_smoothing_attack` -- a pixel that stays in the kp set
+         across iters gets compounded smoothing, which is what kills
+         stubborn kps). Zero delta_track at kp_mask_iter so the Amerini
+         paste fully owns those pixels this iter.
       4. Forward (x_amer + delta_track) through the tracker, backward L_rtaa
-         into delta_track, sign-step on g_rtaa * (1 - frozen_mask), then
+         into delta_track, sign-step on g_rtaa * (1 - kp_mask_iter), then
          project delta_track into the eps box.
 
-    The two perturbations are spatially disjoint by construction, so the
-    Amerini side contributes no L_inf budget pressure on the PGD side --
+    Cross-iter, a pixel can flip between Amerini and PGD ownership as the
+    kp set evolves -- the disjointness invariant is per-iter, not global.
     `eps` bounds only the PGD contribution.
 
     Returns
@@ -952,16 +954,22 @@ def rtaa_amerini_combined_attack_frame(net,
     target_sz_norm = _sz_t(tsz0, tsz1)
     target_ratio = tsz0 / tsz1
 
-    # x_amer accumulates Amerini's smoothing at frozen pixels; starts as clean.
-    # delta_track is the PGD perturbation, always zero where frozen_mask == 1.
+    # x_amer holds the most-recent Amerini contribution at each pixel
+    # (overwritten whenever a pixel falls in the current iter's kp_mask).
+    # delta_track is the PGD perturbation, zeroed at the current iter's
+    # kp_mask so the Amerini paste fully owns those pixels.
     x_amer = x_clean_frame.clone()
     delta_track = torch.zeros_like(x_clean_frame, requires_grad=True)
-    frozen_mask = torch.zeros(1, 1, H, W, device=device)
 
     n_kp_iter_list = []
+    kp_mask_iter = torch.zeros(1, 1, H, W, device=device)
 
     for i in range(iteration):
-        # --- (1)-(3) Amerini update on the currently attacked image ---
+        # --- (1)-(3) One Amerini smoothing step on the currently attacked
+        # image. Matches `amerini_smoothing_attack`: blur the full image,
+        # paste blurred values into ALL currently-detected kp windows. A
+        # pixel that stays in the kp set across iters gets compounded
+        # smoothing (each iter blurs the previous-iter blurred value).
         with torch.no_grad():
             x_work_det = torch.clamp(x_amer + delta_track.detach(),
                                      x_val_min, x_val_max)
@@ -971,8 +979,7 @@ def rtaa_amerini_combined_attack_frame(net,
             )
             n_kp_iter_list.append(int(n_kp))
 
-            new_pixels = (kp_mask_iter * (1.0 - frozen_mask)).clamp_(0.0, 1.0)
-            if float(new_pixels.sum().item()) > 0.0:
+            if float(kp_mask_iter.sum().item()) > 0.0:
                 x_np = x_work_det.squeeze(0).permute(1, 2, 0).cpu().numpy()
                 x_np = np.clip(x_np, 0, 255).astype(np.uint8)
                 blurred = cv2.GaussianBlur(x_np, (amer_ksize, amer_ksize),
@@ -980,11 +987,10 @@ def rtaa_amerini_combined_attack_frame(net,
                 blurred_t = torch.from_numpy(
                     blurred.astype(np.float32).transpose(2, 0, 1)
                 ).unsqueeze(0).to(device)
-                x_amer = x_amer * (1.0 - new_pixels) + blurred_t * new_pixels
-                # Preserve disjointness: kill any PGD content at newly frozen.
-                delta_track.data.mul_(1.0 - new_pixels)
-
-            frozen_mask = torch.maximum(frozen_mask, kp_mask_iter)
+                x_amer = x_amer * (1.0 - kp_mask_iter) + blurred_t * kp_mask_iter
+                # Per-iter disjointness: zero PGD at currently-amerini pixels
+                # (the paste subsumes whatever PGD had accumulated there).
+                delta_track.data.mul_(1.0 - kp_mask_iter)
 
         # --- (4) PGD step on the complement of frozen_mask ---
         x_work = x_amer + delta_track  # delta_track has requires_grad
@@ -1062,8 +1068,8 @@ def rtaa_amerini_combined_attack_frame(net,
         if loss_log is not None:
             loss_log.setdefault('L_rtaa', []).append(float(L_rtaa.detach()))
             loss_log.setdefault('amer_n_kps_iter', []).append(float(n_kp))
-            loss_log.setdefault('amer_frozen_frac',
-                                []).append(float(frozen_mask.mean().item()))
+            loss_log.setdefault('amer_kp_frac_iter',
+                                []).append(float(kp_mask_iter.mean().item()))
 
         net.zero_grad()
         if delta_track.grad is not None:
@@ -1076,14 +1082,15 @@ def rtaa_amerini_combined_attack_frame(net,
         if g_rtaa is None:
             g_rtaa = torch.zeros_like(delta_track)
 
-        g_masked = g_rtaa * (1.0 - frozen_mask)
+        g_masked = g_rtaa * (1.0 - kp_mask_iter)
         delta_track = delta_track - alpha * rtaa_weight * torch.sign(g_masked)
         delta_track = torch.clamp(delta_track, -eps, eps)
-        # Pixel-range clamp via x_clean (non-frozen pixels evolve from x_clean
-        # under PGD; frozen pixels evolve from x_amer and stay in range there).
+        # Pixel-range clamp via x_clean (non-kp pixels evolve from x_clean
+        # under PGD; kp pixels for this iter evolve from x_amer and stay in
+        # range there).
         delta_track = torch.clamp(x_clean_frame + delta_track,
                                   x_val_min, x_val_max) - x_clean_frame
-        delta_track = delta_track * (1.0 - frozen_mask)
+        delta_track = delta_track * (1.0 - kp_mask_iter)
         delta_track = Variable(delta_track.detach(), requires_grad=True)
 
     x_final = torch.clamp(x_amer + delta_track, x_val_min, x_val_max)
@@ -1092,8 +1099,8 @@ def rtaa_amerini_combined_attack_frame(net,
     delta_total = (x_final - x_clean_frame).detach()
 
     if loss_log is not None:
-        loss_log.setdefault('amer_frozen_frac_final',
-                            []).append(float(frozen_mask.mean().item()))
+        loss_log.setdefault('amer_kp_frac_final',
+                            []).append(float(kp_mask_iter.mean().item()))
         loss_log.setdefault('amer_n_kps_init',
                             []).append(float(n_kp_iter_list[0]
                                              if n_kp_iter_list else 0))

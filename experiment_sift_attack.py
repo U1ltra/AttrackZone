@@ -849,7 +849,7 @@ def save_log(out_path, benign_log, attack_log, args):
         sparse_area_frac_final   = _stack_scalar('sparse_area_frac_final'),
 
         # Per-frame rtaa_amerini diagnostics (NaN unless --attack rtaa_amerini)
-        amer_frozen_frac_final   = _stack_scalar('amer_frozen_frac_final'),
+        amer_kp_frac_final       = _stack_scalar('amer_kp_frac_final'),
         amer_n_kps_init          = _stack_scalar('amer_n_kps_init'),
         amer_n_kps_final         = _stack_scalar('amer_n_kps_final'),
     )
