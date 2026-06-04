@@ -217,11 +217,15 @@ def count_kps_in_roi(detector, frame, bbox):
 
 def save_delta_heatmap(out_dir, frame_idx, im_clean, im_attacked,
                        target_pos, s_x_int, r_target_frame_bbox,
-                       attack_label):
+                       attack_label, detector=None):
     """Save a 4-panel viz of the per-frame perturbation localised to the
     search-region crop:
 
       [Clean | Attacked | |delta| magnitude | Support binary mask]
+
+    When `detector` is supplied, SIFT keypoints inside R_target are
+    overlaid on the clean (green) and attacked (yellow) panels, so the
+    investigator can see which kps appeared, vanished, or moved.
 
     `delta` is computed as im_attacked - im_clean (int16). Works for any
     attack variant because we don't need the attack's internal delta tensor.
@@ -251,11 +255,32 @@ def save_delta_heatmap(out_dir, frame_idx, im_clean, im_attacked,
     rx, ry, rw, rh = r_target_frame_bbox
     rx_c, ry_c = float(rx) - ix1, float(ry) - iy1
 
-    fig, axes = plt.subplots(1, 4, figsize=(17, 4.5))
+    # Detect SIFT kps inside R_target on the FULL frames, then project to
+    # crop coords. Detection on the full frame matches what the defense
+    # measures (count_kps_in_roi uses the full frame too).
+    kp_clean_xy, kp_atk_xy = None, None
+    if detector is not None:
+        full_mask = _bbox_to_image_mask(im_clean.shape, r_target_frame_bbox)
+        if full_mask.sum() > 0:
+            kpc, _ = detector.extract_features(im_clean,    mask=full_mask)
+            kpa, _ = detector.extract_features(im_attacked, mask=full_mask)
+            kp_clean_xy = np.array([[k.pt[0] - ix1, k.pt[1] - iy1] for k in kpc])
+            kp_atk_xy   = np.array([[k.pt[0] - ix1, k.pt[1] - iy1] for k in kpa])
+
+    fig, axes = plt.subplots(1, 4, figsize=(24, 7))
     axes[0].imshow(cv2.cvtColor(clean_crop,    cv2.COLOR_BGR2RGB))
-    axes[0].set_title('Clean crop')
+    n_c = len(kp_clean_xy) if kp_clean_xy is not None else 0
+    axes[0].set_title(f'Clean crop  (kps in R={n_c})')
     axes[1].imshow(cv2.cvtColor(attacked_crop, cv2.COLOR_BGR2RGB))
-    axes[1].set_title('Attacked crop')
+    n_a = len(kp_atk_xy) if kp_atk_xy is not None else 0
+    axes[1].set_title(f'Attacked crop  (kps in R={n_a})')
+
+    if kp_clean_xy is not None and len(kp_clean_xy) > 0:
+        axes[0].scatter(kp_clean_xy[:, 0], kp_clean_xy[:, 1],
+                        s=20, edgecolors='lime', facecolors='none', linewidth=1.0)
+    if kp_atk_xy is not None and len(kp_atk_xy) > 0:
+        axes[1].scatter(kp_atk_xy[:, 0], kp_atk_xy[:, 1],
+                        s=20, edgecolors='yellow', facecolors='none', linewidth=1.0)
 
     im3 = axes[2].imshow(abs_d, cmap='hot', vmin=0)
     axes[2].set_title(f'|delta| magnitude  (max={int(abs_d.max())})')
@@ -264,9 +289,17 @@ def save_delta_heatmap(out_dir, frame_idx, im_clean, im_attacked,
     axes[3].imshow(touched, cmap='gray', vmin=0, vmax=1)
     axes[3].set_title(f'Support  ({100.0 * touched.mean():.2f}% touched)')
 
+    # Also overlay attacked-frame kps on the |delta| panel so we can see
+    # whether new kps land on PGD-perturbed pixels vs amerini-frozen pixels.
+    if kp_atk_xy is not None and len(kp_atk_xy) > 0:
+        axes[2].scatter(kp_atk_xy[:, 0], kp_atk_xy[:, 1],
+                        s=15, edgecolors='cyan', facecolors='none', linewidth=0.8)
+
     for ax in axes[:2]:
         ax.add_patch(Rectangle((rx_c, ry_c), rw, rh,
                                edgecolor='cyan', facecolor='none', linewidth=1.2))
+    axes[2].add_patch(Rectangle((rx_c, ry_c), rw, rh,
+                                edgecolor='cyan', facecolor='none', linewidth=1.2))
     for ax in axes:
         ax.set_xticks([]); ax.set_yticks([])
 
@@ -274,7 +307,7 @@ def save_delta_heatmap(out_dir, frame_idx, im_clean, im_attacked,
     fig.tight_layout()
     os.makedirs(out_dir, exist_ok=True)
     fig.savefig(join(out_dir, f'delta_f{frame_idx:04d}.png'),
-                dpi=80, bbox_inches='tight')
+                dpi=140, bbox_inches='tight')
     plt.close(fig)
 
 
@@ -1032,6 +1065,7 @@ def main():
                 s_x_int=a_e['s_x_int'],
                 r_target_frame_bbox=a_e['r_target_bbox'],
                 attack_label=args.attack,
+                detector=detector,
             )
         print(f"Viz  -> {viz_dir}/  ({len(attack_log)} frames)")
 
