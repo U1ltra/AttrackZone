@@ -602,6 +602,75 @@ def simulate_attack(net, detector, image_files, gt, init_frame, sim_frames, args
             loss_log['amerini_kp_init']  = [float(kp_amer_init)]
             loss_log['amerini_kp_final'] = [float(kp_amer_final)]
 
+        elif args.attack == 'rtaa_sift_then_amerini':
+            # Stage 1: rtaa_sift_frame -- joint L_rtaa + L_dog PGD. L_dog
+            # gradient-shapes delta away from creating new DoG peaks during
+            # optimization, so the post-PGD frame should already have many
+            # fewer kps than pure RTAA.
+            x_frame_clean = _extract_x_crop_frame(state, im, s_x_int)
+            r_target_crop = frame_bbox_to_crop_bbox_frame_res(
+                r_target_frame, target_pos, s_x_int
+            )
+            sparse_mask_t = None
+            if args.sparse_mask:
+                sparse_mask_t, n_kp_for_mask, area_frac = build_kp_sparse_mask(
+                    detector, im, r_target_frame, target_pos, s_x_int,
+                    half_side=args.sparse_half_side,
+                )
+                loss_log['sparse_n_kps']     = [float(n_kp_for_mask)]
+                loss_log['sparse_area_frac'] = [float(area_frac)]
+            delta_pgd_t, _ = rtaa_sift_attack_frame(
+                net, x_frame_clean, prev_pred_bbox,
+                target_pos, target_sz, scale_z, p,
+                r_target_crop_bbox=r_target_crop,
+                eps=args.eps, iteration=args.n_iter,
+                final_pos=final_pos, im_bounds=im_bounds,
+                attack_mask_frame=sparse_mask_t,
+                refresh_detector=(detector if args.sparse_mask
+                                  and args.sparse_refresh_every > 0
+                                  else None),
+                refresh_every=args.sparse_refresh_every,
+                refresh_cap=args.sparse_refresh_cap,
+                refresh_half_side=args.sparse_half_side,
+                alpha_dog=args.alpha_dog, gamma_kornia=args.gamma_kornia,
+                dog_contrast=args.dog_contrast,
+                rtaa_weight=args.rtaa_weight,
+                compute_grad_alignment=args.diag_grad_alignment,
+                loss_log=loss_log,
+            )
+            im_pgd = inject_frame_res(im, delta_pgd_t, target_pos, s_x_int)
+
+            # Stage 2: final Amerini cleanup. `--amerini_max_iter` caps the
+            # rounds; pass a small value (e.g. 5) for "a few rounds".
+            im_attacked_pre, n_amerini, kp_amer_final, kp_amer_init = (
+                amerini_smoothing_attack(
+                    im_pgd, r_target_frame, detector,
+                    sigma=args.amerini_sigma,
+                    gaussian_ksize=args.amerini_ksize,
+                    patch_half=args.amerini_patch_half,
+                    max_iter=args.amerini_max_iter,
+                    target_removal=args.amerini_target_removal,
+                )
+            )
+
+            # Stage-2 footprint inside R_target (kp-only perturbation cost).
+            roi_mask = _bbox_to_image_mask(im.shape, r_target_frame).astype(bool)
+            diff_kp  = np.abs(im_attacked_pre.astype(np.int16)
+                              - im_pgd.astype(np.int16)).sum(axis=-1) > 0
+            kp_pert_mask = diff_kp & roi_mask
+            roi_area     = int(roi_mask.sum())
+            kp_pert_frac = (float(kp_pert_mask.sum()) / max(roi_area, 1))
+
+            x_for_tracker = Variable(get_subwindow_tracking(
+                im_attacked_pre, target_pos, p.instance_size,
+                round(s_x), state['avg_chans']
+            ).unsqueeze(0)).cuda()
+            delta_frame_t = None
+            loss_log['amerini_iters']     = [float(n_amerini)]
+            loss_log['amerini_kp_init']   = [float(kp_amer_init)]
+            loss_log['amerini_kp_final']  = [float(kp_amer_final)]
+            loss_log['kp_pert_frac_roi']  = [float(kp_pert_frac)]
+
         elif args.attack == 'rtaa_then_amerini':
             # Stage 1: pure RTAA at frame resolution (alpha_dog=0, no kp
             # objective). Produces a PGD-attacked frame.
@@ -679,7 +748,8 @@ def simulate_attack(net, detector, image_files, gt, init_frame, sim_frames, args
         # Render the attacked frame
         if args.attack == 'none':
             im_attacked = im.copy()
-        elif args.attack in ('amerini_smoothing', 'rtaa_then_amerini'):
+        elif args.attack in ('amerini_smoothing', 'rtaa_then_amerini',
+                             'rtaa_sift_then_amerini'):
             im_attacked = im_attacked_pre
         elif args.attack in ('rtaa_sift_frame', 'rtaa_amerini'):
             im_attacked = inject_frame_res(im, delta_frame_t, target_pos, s_x_int)
@@ -1006,7 +1076,8 @@ def main():
     parser.add_argument('--attack', default='rtaa_sift_frame',
                         choices=['none', 'rtaa', 'rtaa_sift_crop',
                                  'rtaa_sift_frame', 'amerini_smoothing',
-                                 'rtaa_amerini', 'rtaa_then_amerini'])
+                                 'rtaa_amerini', 'rtaa_then_amerini',
+                                 'rtaa_sift_then_amerini'])
     parser.add_argument('--eps',          type=float, default=16.0,
                         help='L_inf perturbation budget in pixel units')
     parser.add_argument('--n_iter',       type=int,   default=10)

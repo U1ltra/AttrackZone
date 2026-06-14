@@ -185,6 +185,18 @@ def _variant_tag(args):
         parts.append(f'as{args.amerini_sigma:g}')
         parts.append(f'ah{args.amerini_patch_half}')
         parts.append(f'ai{args.amerini_max_iter}')
+    if args.attack == 'rtaa_sift_then_amerini':
+        # Stage-1 PGD args (joint L_rtaa + L_dog) + stage-2 Amerini cap.
+        parts.append(f'ad{int(args.alpha_dog)}')
+        parts.append(f'dc{args.dog_contrast:g}')
+        parts.append(f'rw{args.rtaa_weight:g}')
+        if args.sparse_mask:
+            parts.append(f'smk{args.sparse_half_side}')
+            if args.sparse_refresh_every > 0:
+                parts.append(f'rf{args.sparse_refresh_every}c{args.sparse_refresh_cap}')
+        parts.append(f'as{args.amerini_sigma:g}')
+        parts.append(f'ah{args.amerini_patch_half}')
+        parts.append(f'ai{args.amerini_max_iter}')
     return '_'.join(parts)
 
 
@@ -247,6 +259,21 @@ def run_experiment(video, seed, args):
             '--amerini_max_iter',       str(args.amerini_max_iter),
             '--amerini_target_removal', str(args.amerini_target_removal),
         ]
+    if args.attack == 'rtaa_sift_then_amerini':
+        cmd += [
+            '--amerini_sigma',          str(args.amerini_sigma),
+            '--amerini_ksize',          str(args.amerini_ksize),
+            '--amerini_patch_half',     str(args.amerini_patch_half),
+            '--amerini_max_iter',       str(args.amerini_max_iter),
+            '--amerini_target_removal', str(args.amerini_target_removal),
+        ]
+        if args.sparse_mask:
+            cmd += ['--sparse_mask',
+                    '--sparse_half_side',     str(args.sparse_half_side),
+                    '--sparse_refresh_every', str(args.sparse_refresh_every),
+                    '--sparse_refresh_cap',   str(args.sparse_refresh_cap)]
+        if args.diag_grad_alignment:
+            cmd += ['--diag_grad_alignment']
 
     r = subprocess.run(cmd, capture_output=True, text=True)
     if r.returncode != 0:
@@ -441,7 +468,8 @@ def main():
     parser.add_argument('--attack', default='rtaa_sift_frame',
                         choices=['none', 'rtaa', 'rtaa_sift_crop',
                                  'rtaa_sift_frame', 'amerini_smoothing',
-                                 'rtaa_amerini', 'rtaa_then_amerini'])
+                                 'rtaa_amerini', 'rtaa_then_amerini',
+                                 'rtaa_sift_then_amerini'])
     parser.add_argument('--eps',          type=float, default=16.0)
     parser.add_argument('--n_iter',       type=int,   default=10)
     parser.add_argument('--alpha_dog',    type=float, default=1000.0)
