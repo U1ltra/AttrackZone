@@ -103,6 +103,27 @@ def frame_bbox_to_crop_bbox_frame_res(bbox_frame, target_pos, s_x_int):
     return [cx0, cy0, max(cx1 - cx0, 0.0), max(cy1 - cy0, 0.0)]
 
 
+def build_bbox_crop_mask(bbox_frame, target_pos, s_x_int, device='cuda'):
+    """Hard {0,1} mask of shape (1, 1, s_x_int, s_x_int) covering `bbox_frame`
+    in the s_x_int crop's pixel coords. Outside the crop the bbox is
+    truncated. Returns a non-empty zero mask if the bbox does not intersect
+    the crop. Used to constrain the L_rtaa-gradient-driven perturbation to
+    the GT-bbox region (physical-patch approximation).
+    """
+    import torch
+    cx, cy, cw, ch = frame_bbox_to_crop_bbox_frame_res(
+        bbox_frame, target_pos, s_x_int
+    )
+    m = np.zeros((s_x_int, s_x_int), dtype=np.float32)
+    if cw > 0 and ch > 0:
+        x0 = int(round(cx)); y0 = int(round(cy))
+        x1 = min(int(round(cx + cw)), s_x_int)
+        y1 = min(int(round(cy + ch)), s_x_int)
+        if x1 > x0 and y1 > y0:
+            m[y0:y1, x0:x1] = 1.0
+    return torch.from_numpy(m).unsqueeze(0).unsqueeze(0).to(device)
+
+
 # ---------------------------------------------------------------------------
 # Network forward — argmax-pscore decode, updates state.
 # ---------------------------------------------------------------------------
@@ -559,6 +580,10 @@ def simulate_attack(net, detector, image_files, gt, init_frame, sim_frames, args
                 )
                 loss_log['sparse_n_kps']     = [float(n_kp_for_mask)]
                 loss_log['sparse_area_frac'] = [float(area_frac)]
+            rtaa_mask_t = (build_bbox_crop_mask(gt[f], target_pos, s_x_int)
+                           if args.rtaa_mask_gt else None)
+            if rtaa_mask_t is not None:
+                loss_log['rtaa_mask_frac'] = [float(rtaa_mask_t.mean().item())]
             delta_frame_t, x_for_tracker = rtaa_sift_attack_frame(
                 net, x_frame_clean, prev_pred_bbox,
                 target_pos, target_sz, scale_z, p,
@@ -566,6 +591,7 @@ def simulate_attack(net, detector, image_files, gt, init_frame, sim_frames, args
                 eps=args.eps, iteration=args.n_iter,
                 final_pos=final_pos, im_bounds=im_bounds,
                 attack_mask_frame=sparse_mask_t,
+                rtaa_mask_frame=rtaa_mask_t,
                 refresh_detector=(detector if args.sparse_mask
                                   and args.sparse_refresh_every > 0
                                   else None),
@@ -619,6 +645,10 @@ def simulate_attack(net, detector, image_files, gt, init_frame, sim_frames, args
                 )
                 loss_log['sparse_n_kps']     = [float(n_kp_for_mask)]
                 loss_log['sparse_area_frac'] = [float(area_frac)]
+            rtaa_mask_t = (build_bbox_crop_mask(gt[f], target_pos, s_x_int)
+                           if args.rtaa_mask_gt else None)
+            if rtaa_mask_t is not None:
+                loss_log['rtaa_mask_frac'] = [float(rtaa_mask_t.mean().item())]
             delta_pgd_t, _ = rtaa_sift_attack_frame(
                 net, x_frame_clean, prev_pred_bbox,
                 target_pos, target_sz, scale_z, p,
@@ -626,6 +656,7 @@ def simulate_attack(net, detector, image_files, gt, init_frame, sim_frames, args
                 eps=args.eps, iteration=args.n_iter,
                 final_pos=final_pos, im_bounds=im_bounds,
                 attack_mask_frame=sparse_mask_t,
+                rtaa_mask_frame=rtaa_mask_t,
                 refresh_detector=(detector if args.sparse_mask
                                   and args.sparse_refresh_every > 0
                                   else None),
@@ -678,12 +709,17 @@ def simulate_attack(net, detector, image_files, gt, init_frame, sim_frames, args
             r_target_crop = frame_bbox_to_crop_bbox_frame_res(
                 r_target_frame, target_pos, s_x_int
             )
+            rtaa_mask_t = (build_bbox_crop_mask(gt[f], target_pos, s_x_int)
+                           if args.rtaa_mask_gt else None)
+            if rtaa_mask_t is not None:
+                loss_log['rtaa_mask_frac'] = [float(rtaa_mask_t.mean().item())]
             delta_pgd_t, _ = rtaa_sift_attack_frame(
                 net, x_frame_clean, prev_pred_bbox,
                 target_pos, target_sz, scale_z, p,
                 r_target_crop_bbox=r_target_crop,
                 eps=args.eps, iteration=args.n_iter,
                 final_pos=final_pos, im_bounds=im_bounds,
+                rtaa_mask_frame=rtaa_mask_t,
                 alpha_dog=0.0, gamma_kornia=0.0,
                 rtaa_weight=1.0,
                 loss_log=loss_log,
@@ -728,6 +764,10 @@ def simulate_attack(net, detector, image_files, gt, init_frame, sim_frames, args
             r_target_crop = frame_bbox_to_crop_bbox_frame_res(
                 r_target_frame, target_pos, s_x_int
             )
+            rtaa_mask_t = (build_bbox_crop_mask(gt[f], target_pos, s_x_int)
+                           if args.rtaa_mask_gt else None)
+            if rtaa_mask_t is not None:
+                loss_log['rtaa_mask_frac'] = [float(rtaa_mask_t.mean().item())]
             delta_frame_t, x_for_tracker = rtaa_amerini_combined_attack_frame(
                 net, x_frame_clean, prev_pred_bbox,
                 target_pos, target_sz, scale_z, p,
@@ -739,6 +779,7 @@ def simulate_attack(net, detector, image_files, gt, init_frame, sim_frames, args
                 amer_ksize=args.amerini_ksize,
                 amer_patch_half=args.amerini_patch_half,
                 rtaa_weight=args.rtaa_weight,
+                rtaa_mask_frame=rtaa_mask_t,
                 loss_log=loss_log,
             )
 
@@ -948,9 +989,16 @@ def save_log(out_path, benign_log, attack_log, args):
 
         # Per-iter L_rtaa vs L_dog gradient alignment (only populated when
         # --diag_grad_alignment is set; NaN-filled otherwise).
-        grad_cos_sim    = _stack('grad_cos_sim'),
-        grad_sign_agree = _stack('grad_sign_agree'),
-        grad_norm_ratio = _stack('grad_norm_ratio'),
+        grad_cos_sim     = _stack('grad_cos_sim'),
+        grad_sign_agree  = _stack('grad_sign_agree'),
+        grad_norm_ratio  = _stack('grad_norm_ratio'),
+        grad_rtaa_nz_frac = _stack('grad_rtaa_nz_frac'),
+        grad_dog_nz_frac  = _stack('grad_dog_nz_frac'),
+        grad_both_nz_frac = _stack('grad_both_nz_frac'),
+
+        # Per-frame rtaa-mask diagnostic (fraction of crop covered by the
+        # L_rtaa gradient gate; NaN unless --rtaa_mask_gt).
+        rtaa_mask_frac    = _stack_scalar('rtaa_mask_frac'),
 
         # Per-frame pixel-magnitude diagnostics. Generic — populated for any
         # attack variant except 'none', so amerini and PGD variants can be
@@ -1115,11 +1163,23 @@ def main():
                              'the full R_target after many iters).')
     parser.add_argument('--diag_grad_alignment', action='store_true',
                         help='At every PGD iter, backward L_rtaa and L_dog '
-                             'separately into delta-space and log three '
-                             'agreement metrics: grad_cos_sim, '
-                             'grad_sign_agree, grad_norm_ratio. Costs ~2x '
-                             'backward per iter; turn on for analysis only. '
-                             'Honoured by --attack rtaa_sift_frame.')
+                             'separately into delta-space and log per-iter '
+                             'metrics: grad_cos_sim, grad_sign_agree, '
+                             'grad_norm_ratio, plus location-overlap '
+                             'fractions grad_rtaa_nz_frac, grad_dog_nz_frac, '
+                             'grad_both_nz_frac. Costs ~2x backward per iter; '
+                             'turn on for analysis only. Honoured by any '
+                             'attack that goes through rtaa_sift_attack_frame '
+                             '(rtaa_sift_frame, rtaa_then_amerini, '
+                             'rtaa_sift_then_amerini).')
+    parser.add_argument('--rtaa_mask_gt', action='store_true',
+                        help='Constrain the L_rtaa-gradient-driven '
+                             'perturbation to the current frame\'s GT bbox '
+                             '(crop-relative). Approximates a physical patch '
+                             'limited to the target vehicle. Independent of '
+                             '--sparse_mask (which gates the kp-side gradient). '
+                             'Honoured by rtaa_sift_frame, rtaa_amerini, '
+                             'rtaa_then_amerini, rtaa_sift_then_amerini.')
     # --- Amerini smoothing-attack knobs (only honoured by amerini_smoothing) ---
     parser.add_argument('--amerini_sigma',          type=float, default=0.7,
                         help='Gaussian std for the per-kp smoothing (paper: 0.7)')

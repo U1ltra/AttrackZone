@@ -612,6 +612,13 @@ def rtaa_sift_attack_frame(net,
                            pseudo_iou_thresh=0.1, truth_suppress_iou_thresh=0.1,
                            final_pos=None, im_bounds=None,
                            attack_mask_frame=None,
+                           # Spatial gate for the L_rtaa gradient. {0,1} float
+                           # mask broadcastable to delta. Restricts the
+                           # tracking-attack perturbation to the masked region
+                           # (e.g. the GT-bbox -> "perturb only on the vehicle"
+                           # to approximate a physical patch). Independent of
+                           # attack_mask_frame which gates g_dog/g_kornia.
+                           rtaa_mask_frame=None,
                            # --- Periodic sparse-mask refresh (re-detect kps in
                            # the *currently perturbed* crop, union-extend the
                            # mask so new/displaced kps become attackable.
@@ -628,7 +635,9 @@ def rtaa_sift_attack_frame(net,
                            # Per-iter measurement of how L_rtaa and L_dog
                            # gradients agree, disagree, or are orthogonal in
                            # delta-space. Logs grad_cos_sim, grad_sign_agree,
-                           # grad_norm_ratio. Costs ~2x backward per iter.
+                           # grad_norm_ratio, plus per-iter location-overlap
+                           # fractions (grad_rtaa_nz_frac, grad_dog_nz_frac,
+                           # grad_both_nz_frac). Costs ~2x backward per iter.
                            compute_grad_alignment=False,
                            loss_log=None,
                            model_sz=271):
@@ -838,21 +847,44 @@ def rtaa_sift_attack_frame(net,
                 cos = float(torch.dot(a, b).item() / (na * nb))
             else:
                 cos = float('nan')
+            # Per-pixel (any-channel) nonzero masks for location overlap.
+            # Sum |g| across channels so a single-channel nonzero counts the
+            # pixel as "having signal".
+            a_pix = g_rtaa.abs().sum(dim=1).flatten()
+            b_pix = g_dog.abs().sum(dim=1).flatten()
+            n_pix = a_pix.numel()
+            rtaa_nz = a_pix > 0
+            dog_nz  = b_pix > 0
+            both_nz_pix = rtaa_nz & dog_nz
+            rtaa_nz_frac = float(rtaa_nz.float().mean().item())
+            dog_nz_frac  = float(dog_nz.float().mean().item())
+            both_nz_frac = float(both_nz_pix.float().mean().item())
+            # Existing element-wise sign agreement on the over-channel flat.
             both_nz = (a != 0) & (b != 0)
             n_both  = int(both_nz.sum().item())
             agree = (float(((torch.sign(a) == torch.sign(b)) & both_nz)
                            .sum().item()) / n_both) if n_both > 0 else float('nan')
             ratio = (nb / na) if na > 1e-12 else float('nan')
-            loss_log.setdefault('grad_cos_sim',    []).append(cos)
-            loss_log.setdefault('grad_sign_agree', []).append(agree)
-            loss_log.setdefault('grad_norm_ratio', []).append(ratio)
+            loss_log.setdefault('grad_cos_sim',     []).append(cos)
+            loss_log.setdefault('grad_sign_agree',  []).append(agree)
+            loss_log.setdefault('grad_norm_ratio',  []).append(ratio)
+            loss_log.setdefault('grad_rtaa_nz_frac', []).append(rtaa_nz_frac)
+            loss_log.setdefault('grad_dog_nz_frac',  []).append(dog_nz_frac)
+            loss_log.setdefault('grad_both_nz_frac', []).append(both_nz_frac)
+
+        # Gate g_rtaa to rtaa_mask_frame if supplied (e.g. GT-bbox region
+        # only, modelling a physical-patch constraint on the tracking attack).
+        if rtaa_mask_frame is not None:
+            g_rtaa_eff = g_rtaa * rtaa_mask_frame
+        else:
+            g_rtaa_eff = g_rtaa
 
         if attack_mask_frame is not None:
-            g_combined = rtaa_weight * g_rtaa + alpha_dog * (g_dog * attack_mask_frame)
+            g_combined = rtaa_weight * g_rtaa_eff + alpha_dog * (g_dog * attack_mask_frame)
             if gamma_kornia > 0:
                 g_combined = g_combined + gamma_kornia * (g_kornia * attack_mask_frame)
         else:
-            g_combined = rtaa_weight * g_rtaa + alpha_dog * g_dog
+            g_combined = rtaa_weight * g_rtaa_eff + alpha_dog * g_dog
             if gamma_kornia > 0:
                 g_combined = g_combined + gamma_kornia * g_kornia
 
@@ -889,6 +921,13 @@ def rtaa_amerini_combined_attack_frame(net,
                                        amer_ksize=3,
                                        amer_patch_half=4,
                                        rtaa_weight=1.0,
+                                       # GT-bbox-style spatial gate on g_rtaa
+                                       # (physical-patch constraint on the
+                                       # tracking attack). When supplied, PGD
+                                       # perturbations land only inside this
+                                       # mask intersected with the per-iter
+                                       # non-kp region.
+                                       rtaa_mask_frame=None,
                                        loss_log=None,
                                        model_sz=271):
     """Combined attack: Amerini smoothing on kp windows + L_rtaa PGD on the
@@ -1083,6 +1122,8 @@ def rtaa_amerini_combined_attack_frame(net,
             g_rtaa = torch.zeros_like(delta_track)
 
         g_masked = g_rtaa * (1.0 - kp_mask_iter)
+        if rtaa_mask_frame is not None:
+            g_masked = g_masked * rtaa_mask_frame
         delta_track = delta_track - alpha * rtaa_weight * torch.sign(g_masked)
         delta_track = torch.clamp(delta_track, -eps, eps)
         # Pixel-range clamp via x_clean (non-kp pixels evolve from x_clean
@@ -1091,6 +1132,8 @@ def rtaa_amerini_combined_attack_frame(net,
         delta_track = torch.clamp(x_clean_frame + delta_track,
                                   x_val_min, x_val_max) - x_clean_frame
         delta_track = delta_track * (1.0 - kp_mask_iter)
+        if rtaa_mask_frame is not None:
+            delta_track = delta_track * rtaa_mask_frame
         delta_track = Variable(delta_track.detach(), requires_grad=True)
 
     x_final = torch.clamp(x_amer + delta_track, x_val_min, x_val_max)

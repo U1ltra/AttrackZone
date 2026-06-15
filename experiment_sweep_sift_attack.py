@@ -197,6 +197,10 @@ def _variant_tag(args):
         parts.append(f'as{args.amerini_sigma:g}')
         parts.append(f'ah{args.amerini_patch_half}')
         parts.append(f'ai{args.amerini_max_iter}')
+    if args.rtaa_mask_gt and args.attack in (
+            'rtaa_sift_frame', 'rtaa_amerini',
+            'rtaa_then_amerini', 'rtaa_sift_then_amerini'):
+        parts.append('rmgt')
     return '_'.join(parts)
 
 
@@ -235,6 +239,10 @@ def run_experiment(video, seed, args):
                 '--sparse_refresh_cap',   str(args.sparse_refresh_cap)]
     if args.attack == 'rtaa_sift_frame' and args.diag_grad_alignment:
         cmd += ['--diag_grad_alignment']
+    if args.rtaa_mask_gt and args.attack in (
+            'rtaa_sift_frame', 'rtaa_amerini',
+            'rtaa_then_amerini', 'rtaa_sift_then_amerini'):
+        cmd += ['--rtaa_mask_gt']
     if args.save_viz:
         cmd += ['--save_viz']
     if args.attack == 'amerini_smoothing':
@@ -476,7 +484,7 @@ def main():
     parser.add_argument('--gamma_kornia', type=float, default=0.0)
     parser.add_argument('--dog_contrast', type=float, default=0.04)
     parser.add_argument('--rtaa_weight',  type=float, default=1.0)
-    parser.add_argument('--roi_source',   default='prev_pred',
+    parser.add_argument('--roi_source',   default='gt',
                         choices=['gt', 'prev_pred'])
     parser.add_argument('--sparse_mask',  action='store_true')
     parser.add_argument('--sparse_half_side',     type=int, default=4)
@@ -489,6 +497,11 @@ def main():
                         help='Log L_rtaa vs L_dog gradient agreement per PGD '
                              'iter. ~2x slower (extra backward passes). Only '
                              'meaningful for --attack rtaa_sift_frame.')
+    parser.add_argument('--rtaa_mask_gt', action='store_true',
+                        help='Constrain L_rtaa-driven perturbation to the '
+                             'GT bbox region (physical-patch approximation). '
+                             'Honoured by rtaa_sift_frame, rtaa_amerini, '
+                             'rtaa_then_amerini, rtaa_sift_then_amerini.')
     parser.add_argument('--save_viz', action='store_true',
                         help='Per-frame perturbation heatmap PNGs. Generates '
                              'NF * #(video, seed) PNGs -- use on small sweeps '
